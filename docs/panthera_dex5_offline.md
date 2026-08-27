@@ -24,6 +24,7 @@ no DDS domain 0**. Everything below was measured on this machine unless marked *
 | g10 | Exit 1 on a caught exception | `teleop/teleop_hand_and_arm.py` |
 | g11 | This document's exit/state sections | `docs/` |
 | g12 | Clamp + slew limit on hand targets | `hand_config.py`, `robot_hand_unitree.py`, `tools/{fake_hand_state,test_dex5_clamp_slew}.py`, `docs/` |
+| g13 | Two read-only visit tools: DDS census, Quest link check | `tools/{domain0_census,quest_link_check}.py`, `docs/` |
 
 ### The two G1 conflict resolutions
 
@@ -242,6 +243,28 @@ design (the simulator ships a Dex3 hand only).
 
    Cleanup failures inside `finally` (recorder close, image client close, go-home) are
    logged individually and do **not** flip a clean run to 1.
+
+---
+
+## 3b. The tools, and what their exit codes mean
+
+Every tool defaults to `--domain 1` so a mistyped command cannot reach the robot;
+`--domain 0` is always deliberate.
+
+| tool | what it does | exit codes |
+|---|---|---|
+| `tools/domain0_census.py` | **read-only.** Who is on the domain, and who writes `rt/lowstate`, `rt/lowcmd`, `rt/arm_sdk` and the two hand state topics — per-writer GUID, IP and rate, plus whether all writers agree on the message type | 0 all verdicts OK · 3 a STOP verdict fired · 4 the domain is empty apart from the tool |
+| `tools/quest_link_check.py` | **no DDS at all.** Brings up televuer exactly as the launcher does, prints the headset URL per local IP, and streams head/wrist/`motion_data_ready`/pinch once connected | 0 connected and hands tracked · 2 nothing ever connected · 3 connected but `motion_data_ready` never went true |
+| `tools/hand_probe.py` | **read-only.** Hand state census: `n_motor`, `n_press`, the tactile index map, temperatures, the 4k+3 coupling hint | 0 both sides streamed · 3 a side was silent |
+| `tools/hand_step.py` | **commands the hardware.** One-joint step response; interlocked behind `PANTHERA_HAND_CMD_OK=1` | 0 ok · 2 args/interlock · 3 no state · 4 thermal abort · 5 motor-count mismatch |
+| `tools/test_dex5_failclosed.py` | Exercises the pre-flight and controller refusal paths | 0 the case behaved as expected · 1 it did not |
+| `tools/fake_hand_state.py` | Test fixture. Publishes synthetic `HandState_`. Never on the robot's domain | 0 |
+
+**Run the census before Part B, every session.** `domain0_census.py --domain 0 --iface
+$NIC` first: if it exits 3, a STOP verdict fired — an unexpected writer on `rt/lowcmd`,
+any writer at all on `rt/arm_sdk`, or two writers disagreeing about the message type.
+**A STOP verdict means there is no Part B.** Something else is already driving the robot,
+or is about to, and adding a second commander is how arms get broken. Find it first.
 
 ---
 
