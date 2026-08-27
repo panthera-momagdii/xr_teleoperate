@@ -109,6 +109,16 @@ if __name__ == '__main__':
         parser.error("--ee dex5 has no simulation target (unitree_sim_isaaclab ships "
                      "Dex3 only); use --ee dex3 with --sim, or drop --sim")
 
+    # [panthera] The hand model follows from --ee. Choosing an end effector IS choosing a
+    # hand, and requiring a matching env var alongside it is a way to end up commanding
+    # one hand's topics with another fitted. HAND_MODEL remains available as an explicit
+    # override for bench work, but if it disagrees with --ee that is an operator mistake,
+    # not a preference -- so it is an error here, before any DDS init and long before
+    # Enter_Debug_Mode, rather than a surprise at the first command.
+    ee_model_error = hand_config.select_model_for_ee(args.ee)
+    if ee_model_error:
+        parser.error(ee_model_error)
+
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
     # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:

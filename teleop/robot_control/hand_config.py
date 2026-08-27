@@ -31,7 +31,13 @@ logger_mp = logging_mp.getLogger(__name__)
 # module was first written for. The Dex5 lane is kept, not deleted: PR #321 remains
 # useful if a Dex5 ever arrives, and deleting a verified path to make room for a new one
 # loses the verification. Nothing Dex5 runs unless HAND_MODEL says so.
-HAND_MODEL = os.environ.get("HAND_MODEL", "inspire_ftp").strip().lower()
+# Set explicitly in the environment, or None if it was never set. The difference matters:
+# an explicit HAND_MODEL that disagrees with --ee is an operator mistake worth stopping
+# for, while a defaulted one is just a default and --ee should win.
+_HAND_MODEL_ENV = os.environ.get("HAND_MODEL")
+_HAND_MODEL_ENV = _HAND_MODEL_ENV.strip().lower() if _HAND_MODEL_ENV else None
+
+HAND_MODEL = _HAND_MODEL_ENV or "inspire_ftp"
 
 MODELS = {
     "inspire_ftp": {
@@ -146,6 +152,73 @@ DEX5_MAX_STEP_RAD = float(os.environ.get("DEX5_MAX_STEP_RAD", "0.05"))
 # mechanical stop. Matches the epsilon dex_retargeting relaxes its own bounds by
 # (dex_retargeting/optimizer.py:47, set_joint_limit(..., epsilon=1e-3)).
 DEX5_LIMIT_MARGIN_RAD = float(os.environ.get("DEX5_LIMIT_MARGIN_RAD", "0.001"))
+
+
+# Which --ee value implies which hand model. The launcher derives the model from --ee so
+# the two cannot disagree silently: choosing an end effector IS choosing a hand, and
+# having to remember a matching env var is a way to command a Dex5's topics with an
+# Inspire fitted. Values not listed here have no hand model of their own.
+EE_TO_MODEL = {
+    "dex5": "dex5",
+    "inspire_ftp": "inspire_ftp",
+}
+
+
+def apply_model(name):
+    """Re-resolve every model-dependent constant in this module for `name`.
+
+    hand_config is imported at launcher start, long before argparse has run, so the model
+    picked at import is only a default. This rebinds the module globals once --ee is
+    known. Call it before anything reads the topics -- i.e. before preflight and before
+    any controller is constructed.
+    """
+    global HAND_MODEL, _MODEL, TOPIC_LEFT_CMD, TOPIC_RIGHT_CMD
+    global TOPIC_LEFT_STATE, TOPIC_RIGHT_STATE, TOPIC_TOUCH
+    global NUM_JOINTS_EXPECTED, TEMP_LIMIT_C
+
+    if name not in MODELS:
+        raise RuntimeError(f"unknown hand model {name!r}; known: {sorted(MODELS)}")
+    HAND_MODEL = name
+    _MODEL = MODELS[name]
+
+    if name == "dex5":
+        TOPIC_LEFT_CMD    = f"{TOPIC_PREFIX}/left/cmd"
+        TOPIC_RIGHT_CMD   = f"{TOPIC_PREFIX}/right/cmd"
+        TOPIC_LEFT_STATE  = f"{TOPIC_PREFIX}/left/state"
+        TOPIC_RIGHT_STATE = f"{TOPIC_PREFIX}/right/state"
+    else:
+        TOPIC_LEFT_CMD    = _MODEL["left_cmd"]
+        TOPIC_RIGHT_CMD   = _MODEL["right_cmd"]
+        TOPIC_LEFT_STATE  = _MODEL["left_state"]
+        TOPIC_RIGHT_STATE = _MODEL["right_state"]
+    TOPIC_TOUCH = _MODEL["touch_topics"]
+
+    # DEX5_NUM_JOINTS is a bench override and keeps winning if it was set.
+    NUM_JOINTS_EXPECTED = (_NUM_JOINTS_ENV if _NUM_JOINTS_ENV is not None
+                           else _MODEL["num_joints"])
+    TEMP_LIMIT_C = float(os.environ.get("HAND_TEMP_LIMIT_C", _MODEL["temp_limit_c"]))
+    return HAND_MODEL
+
+
+def select_model_for_ee(ee):
+    """Derive the hand model from --ee. Returns None on success, or an error string.
+
+    The caller passes the string to parser.error(), so a mismatch exits 2 before any DDS
+    init and before Enter_Debug_Mode -- an operator who sets HAND_MODEL=dex5 and then runs
+    --ee inspire_ftp is told, rather than being given an Inspire hand configured to listen
+    on a Dex5's topics.
+    """
+    want = EE_TO_MODEL.get(ee)
+    if want is None:
+        return None                      # this --ee has no hand model of its own
+    if _HAND_MODEL_ENV is not None and _HAND_MODEL_ENV != want:
+        return (f"--ee {ee} implies HAND_MODEL={want}, but HAND_MODEL={_HAND_MODEL_ENV} "
+                f"is set in the environment. These select different hands "
+                f"({MODELS[want]['label']} vs {MODELS[_HAND_MODEL_ENV]['label']}) on "
+                f"different topics. Unset HAND_MODEL and let --ee decide, or pass the "
+                f"--ee that matches.")
+    apply_model(want)
+    return None
 
 
 def group_of(idx, thumb_base_index=THUMB_BASE_INDEX):
