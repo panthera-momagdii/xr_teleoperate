@@ -62,6 +62,29 @@ EXIT_OK, EXIT_STOP, EXIT_EMPTY = 0, 3, 4
 # check ages badly, and the offline evidence for the OK path needs it settable.
 DEFAULT_EXPECTED_LOWCMD_IP = "192.168.123.161"
 
+# Measured on this robot 2026-08-28: PC1 declares TWO rt/lowcmd writers, one carrying the
+# whole stream and one idle at 0.0 Hz. Same shape on rt/lowstate. More than two is a
+# different finding from a wrong source address, so they are reported separately.
+EXPECTED_LOWCMD_WRITERS = 2
+
+# G1 29-DoF arm joints (teleop/robot_control/robot_arm.py, G1_29_JointArmIndex).
+ARM_JOINTS = {
+    15: "left_shoulder_pitch", 16: "left_shoulder_roll", 17: "left_shoulder_yaw",
+    18: "left_elbow", 19: "left_wrist_roll", 20: "left_wrist_pitch", 21: "left_wrist_yaw",
+    22: "right_shoulder_pitch", 23: "right_shoulder_roll", 24: "right_shoulder_yaw",
+    25: "right_elbow", 26: "right_wrist_roll", 27: "right_wrist_pitch", 28: "right_wrist_yaw",
+}
+SHOULDER_PITCH = (15, 22)
+
+# OUR operating limits, not Unitree's. Unitree publishes no numeric arm-motor temperature
+# limit in any documentation reachable from here -- only a described "thermal derating"
+# behaviour with no threshold. See docs for the reasoning and for the open item to get the
+# real number from Unitree. unitree_sdk2_python issue #129 reports G1 shoulder-pitch
+# overheating with an Inspire FTP hand on arm_sdk but quotes no temperature at all.
+ARM_TEMP_WARN_C = 60
+ARM_TEMP_STOP_C = 75
+HAND_TEMP_WARN_C = 45
+
 # Deep history and best-effort: a KEEP_LAST(1) reader would undercount rt/lowstate at
 # ~999 Hz by orders of magnitude, and a RELIABLE reader would not even match a
 # best-effort writer (RxO: a best-effort reader matches both kinds).
@@ -70,11 +93,27 @@ CENSUS_QOS = Qos(Policy.Reliability.BestEffort, Policy.History.KeepLast(8192))
 POLL_S = 0.002
 
 
+# 224.0.0.0/4. Cyclone lists the discovery multicast group in __NetworkAddresses, and on
+# the robot it lists it FIRST -- e.g.
+#   'udp/239.255.0.1:7400@3,udp/192.168.123.161:40310@3'
+# Taking found[0] therefore reported EVERY writer as coming from 239.255.0.1, which made
+# `foreign` non-empty for every topic and fired a false STOP on rt/lowcmd on 2026-08-28.
+# The tell was that rt/lowstate -- which can only come from PC1 -- reported the same
+# address. A discovery group is not a source.
+_MULTICAST = re.compile(r"^(22[4-9]|23\d)\.")
+
+
 def _ip_of(network_addresses):
-    """'udp/172.20.10.2:47007@3' -> '172.20.10.2'; 'localprocess' -> 'localprocess'."""
+    """The first routable unicast address in __NetworkAddresses.
+
+    'udp/239.255.0.1:7400@3,udp/192.168.123.161:40310@3' -> '192.168.123.161'
+    'udp/172.20.10.2:47007@3'                            -> '172.20.10.2'
+    'localprocess'                                       -> 'localprocess'
+    """
     if not network_addresses:
         return None
-    found = re.findall(r"(\d+\.\d+\.\d+\.\d+)", network_addresses)
+    found = [ip for ip in re.findall(r"(\d+\.\d+\.\d+\.\d+)", network_addresses)
+             if not _MULTICAST.match(ip) and not ip.startswith("127.")]
     if found:
         return found[0]
     return network_addresses.split(",")[0]
@@ -154,12 +193,28 @@ def main():
         (hand_config.TOPIC_LEFT_STATE, HandState_),
         (hand_config.TOPIC_RIGHT_STATE, HandState_),
     ]
+    # The Inspire hands are the ones actually fitted. Their IDL lives in inspire_sdkpy,
+    # which is optional here: if it is missing the census still runs and says so, rather
+    # than refusing to start on a robot where the bridge is not installed yet.
+    try:
+        from inspire_sdkpy import inspire_dds
+        watched += [("rt/inspire_hand/state/l", inspire_dds.inspire_hand_state),
+                    ("rt/inspire_hand/state/r", inspire_dds.inspire_hand_state)]
+        inspire_available = True
+    except Exception as exc:
+        inspire_available = False
+        print(f"  note: inspire_sdkpy not importable ({exc.__class__.__name__}), so "
+              f"rt/inspire_hand/state/* is NOT being watched this run.")
     readers = {}
     for name, kind in watched:
         readers[name] = DataReader(participant, Topic(participant, name, kind), qos=CENSUS_QOS)
 
     counts = defaultdict(lambda: defaultdict(int))     # topic -> publication_handle -> n
     first_seen, last_seen = {}, {}                     # (topic, handle) -> monotonic
+    ticks = defaultdict(list)                          # (topic, handle) -> [tick, ...]
+    stamps = defaultdict(list)                         # (topic, handle) -> [source_timestamp]
+    arm_temp_max = {}                                  # motor index -> max temperature C
+    hand_fields = {}                                   # topic -> last state field snapshot
 
     started = time.monotonic()
     deadline = started + args.seconds
@@ -167,12 +222,46 @@ def main():
     while time.monotonic() < deadline:
         for name, reader in readers.items():
             for sample in reader.take(N=1024):
-                handle = sample.sample_info.publication_handle
+                info = sample.sample_info
+                handle = info.publication_handle
                 counts[name][handle] += 1
                 key = (name, handle)
                 now = time.monotonic()
                 first_seen.setdefault(key, now)
                 last_seen[key] = now
+
+                # Publisher-side sequencing, so the rate does not depend on how fast
+                # THIS process dequeues. See the rate section below.
+                tick = getattr(sample, "tick", None)
+                if tick is not None:
+                    ticks[key].append(int(tick))
+                st = getattr(info, "source_timestamp", None)
+                if st is not None:
+                    stamps[key].append(int(st))
+
+                # Arm motor temperatures. MotorState_.temperature is int16[2] per motor;
+                # take the hotter of the two, and the max over the whole window per joint.
+                ms = getattr(sample, "motor_state", None)
+                if ms is not None:
+                    for idx, motor in enumerate(ms):
+                        t = getattr(motor, "temperature", None)
+                        if t is None:
+                            continue
+                        hot = max(int(x) for x in t) if hasattr(t, "__iter__") else int(t)
+                        if hot > arm_temp_max.get(idx, -999):
+                            arm_temp_max[idx] = hot
+
+                # Inspire hand state: the fields upstream throws away are exactly the
+                # ones a refusal path needs.
+                if hasattr(sample, "angle_act"):
+                    hand_fields[name] = {
+                        "angle_act": [int(v) for v in sample.angle_act],
+                        "force_act": [int(v) for v in getattr(sample, "force_act", [])],
+                        "current": [int(v) for v in getattr(sample, "current", [])],
+                        "err": [int(v) for v in getattr(sample, "err", [])],
+                        "status": [int(v) for v in getattr(sample, "status", [])],
+                        "temperature": [int(v) for v in getattr(sample, "temperature", [])],
+                    }
         if time.monotonic() >= next_tick:
             next_tick += 5.0
             total = sum(sum(v.values()) for v in counts.values())
@@ -227,22 +316,56 @@ def main():
             n = counts[name].get(handle, 0)
             key = (name, handle)
             span = (last_seen.get(key, 0) - first_seen.get(key, 0)) if key in first_seen else 0.0
-            rate = (n / span) if span > 0.2 else (n / window if window else 0.0)
+            observed = (n / span) if span > 0.2 else (n / window if window else 0.0)
+            derived, method, tps, tpsam, med_rate = _derived_rate(
+                ticks.get(key, []), stamps.get(key, []), span, n)
+            # A quiet writer is trustworthy either way: zero dequeued samples over the
+            # window is zero traffic, and there is nothing to derive from.
+            rate = derived if (derived and derived > observed) else observed
+            dropping = bool(derived and observed < 0.9 * derived)
             pinfo = participants.get(w["participant_guid"], {})
             rows.append({**w, "samples": n, "rate_hz": round(rate, 1),
+                         "observed_hz": round(observed, 1),
+                         "derived_hz": round(derived, 1) if derived else None,
+                         "rate_method": method or "count", "dropping": dropping,
+                         "median_hz": round(med_rate, 1) if med_rate else None,
+                         "ticks_per_s": round(tps, 1) if tps else None,
+                         "ticks_per_sample": round(tpsam, 3) if tpsam else None,
                          "ip": pinfo.get("ip"), "hostname": pinfo.get("hostname"),
                          "process": pinfo.get("process"), "pid": pinfo.get("pid")})
         rows.sort(key=lambda r: r["guid"])
 
         print(f"\n  {name}: {len(rows)} writer(s)")
         if rows:
-            print(f"    {'ip':<16} {'rate Hz':>9} {'samples':>8}  {'type fp':<16} writer guid")
+            print(f"    {'ip':<16} {'rate Hz':>9} {'via':<6} {'median':>8} {'seen Hz':>8} "
+                  f"{'samples':>8}  {'type fp':<16} writer guid")
             for r in rows:
-                print(f"    {str(r['ip'] or '?'):<16} {r['rate_hz']:>9.1f} {r['samples']:>8}  "
-                      f"{str(r['type_fingerprint'] or '-'):<16} {r['guid']}")
+                flag = "  DROPPING" if r["dropping"] else ""
+                med = f"{r['median_hz']:>8.1f}" if r["median_hz"] else f"{'-':>8}"
+                print(f"    {str(r['ip'] or '?'):<16} {r['rate_hz']:>9.1f} "
+                      f"{r['rate_method']:<6} {med} {r['observed_hz']:>8.1f} "
+                      f"{r['samples']:>8}  "
+                      f"{str(r['type_fingerprint'] or '-'):<16} {r['guid']}{flag}")
+            if any(r["rate_method"] == "stamp" for r in rows):
+                print("    rate estimator: 1 / p10(source_timestamp deltas) -- the writer's own")
+                print("    send times, so it does not depend on how fast this reader dequeues.")
+                print("    'median' is 1 / median(same deltas): with no drops the two agree, and")
+                print("    every dropped sample pushes the median down while p10 holds.")
             print(f"    total {sum(r['rate_hz'] for r in rows):.1f} Hz across "
                   f"{len(rows)} writer(s); type(s): "
                   f"{sorted({r['type_name'] for r in rows})}")
+            if any(r["dropping"] for r in rows):
+                print("    DROPPING: this reader saw fewer samples than the publisher sent. "
+                      "The rate column is still right (it comes from the publisher's own "
+                      "sequencing); it is the census that is behind, not the robot.")
+            for r in rows:
+                if r["ticks_per_s"]:
+                    print(f"      tick: {r['ticks_per_s']:.1f} ticks/s, "
+                          f"{r['ticks_per_sample']:.3f} ticks/sample "
+                          f"({'a per-publish counter' if 0.9 <= r['ticks_per_sample'] <= 1.1 else 'NOT 1:1 with publishes -- tick is a clock or a multi-step counter, so ticks/s is NOT the publish rate'})")
+            if all(r["rate_method"] == "count" for r in rows) and any(r["samples"] for r in rows):
+                print("    NOTE: rate is this reader's dequeue count -- a FLOOR, not a "
+                      "measurement. No tick field and too few samples to time the publisher.")
 
         verdict = _verdict(name, rows, args.expect_lowcmd_ip)
         stop = stop or verdict["stop"]
@@ -267,8 +390,53 @@ def main():
         else:
             print(f"  {name}: no writers")
 
+    print(f"\n{'=' * 78}\n4. TEMPERATURES\n{'=' * 78}")
+    if arm_temp_max:
+        print("  Arm joint motors, max over the window (rt/lowstate, MotorState_.temperature,")
+        print("  int16[2] per motor -- the hotter of the two is taken):")
+        print(f"    {'idx':>4}  {'joint':<24} {'max C':>6}")
+        for idx in sorted(ARM_JOINTS):
+            if idx in arm_temp_max:
+                mark = "  <-- shoulder pitch" if idx in SHOULDER_PITCH else ""
+                print(f"    {idx:>4}  {ARM_JOINTS[idx]:<24} {arm_temp_max[idx]:>6}{mark}")
+        hot = {i: t for i, t in arm_temp_max.items() if t >= ARM_TEMP_WARN_C}
+        if hot:
+            print(f"    WARNING: {len(hot)} motor(s) at or above {ARM_TEMP_WARN_C} C: "
+                  f"{ {ARM_JOINTS.get(i, i): t for i, t in sorted(hot.items())} }")
+        sp = [arm_temp_max[i] for i in SHOULDER_PITCH if i in arm_temp_max]
+        if sp:
+            print(f"    shoulder pitch max: {max(sp)} C   "
+                  f"(warn {ARM_TEMP_WARN_C}, stop {ARM_TEMP_STOP_C} -- see docs; these are "
+                  f"OUR limits, Unitree publishes none we could find)")
+        non_arm = {i: t for i, t in arm_temp_max.items() if i not in ARM_JOINTS}
+        if non_arm:
+            print(f"    (legs/waist, for context: max {max(non_arm.values())} C across "
+                  f"{len(non_arm)} motors)")
+    else:
+        print("  No rt/lowstate samples with motor_state -- no arm temperatures this run.")
+
+    if hand_fields:
+        print("\n  Inspire hand state, last sample per side. angle_act is the only field")
+        print("  xr_teleoperate reads; err/status/temperature are what a refusal needs:")
+        for topic, f in sorted(hand_fields.items()):
+            print(f"    {topic}")
+            for k in ("angle_act", "force_act", "current", "err", "status", "temperature"):
+                if f.get(k):
+                    print(f"      {k:12s} {f[k]}")
+            errs = [i for i, e in enumerate(f.get("err", [])) if e]
+            if errs:
+                print(f"      *** err NON-ZERO on DOF {errs} -- see the RH56 error bits ***")
+            temps = f.get("temperature", [])
+            if temps and max(temps) >= HAND_TEMP_WARN_C:
+                print(f"      *** temperature {max(temps)} C >= {HAND_TEMP_WARN_C} C ***")
+    elif inspire_available:
+        print("\n  No rt/inspire_hand/state/* samples -- the bridge is not running.")
+
     report = {
         "captured_at": timestamp(),
+        "inspire_topics_watched": inspire_available,
+        "arm_motor_temperature_max_c": {str(k): v for k, v in sorted(arm_temp_max.items())},
+        "inspire_hand_state_fields": hand_fields,
         "domain": args.domain,
         "iface": args.iface,
         "window_s": round(window, 3),
@@ -296,28 +464,101 @@ def main():
     return EXIT_OK
 
 
+def _derived_rate(tick_list, stamp_list, span, n_samples):
+    """Publish rate from the PUBLISHER's own timing, plus the tick scale as a diagnostic.
+
+    The census's sample count is a FLOOR: if the reader cannot keep up it under-reports
+    with no signal. On 2026-08-28 rt/lowcmd (666.5) and rt/lowstate (660.4) landed within
+    1% of each other despite being independent streams from different PC1 processes --
+    the signature of a consumer-side ceiling.
+
+    PRIMARY METHOD: source_timestamp. Each sample carries the writer's own send time, so
+    the inter-sample delta is publisher-side. Taking the 10th percentile of positive
+    deltas recovers the true period: a dropped sample doubles a delta, so a low
+    percentile still finds the real one as long as ANY two adjacent samples were caught.
+    Median would drift with the drop rate; minimum would chase timestamp jitter.
+
+    TICK IS NOT A RATE. LowState_.tick is reported only as ticks/second and
+    ticks/sample, never as the publish rate, because its scale is not documented: it may
+    be a per-publish counter or a millisecond clock, and those give answers that differ
+    by whatever the publish period is. Measured against a fixture publishing at 191.3 Hz
+    while advancing tick by 5 each time, treating tick deltas as a rate reported
+    960.3 Hz and a false DROPPING. ticks_per_sample tells you which it is: ~1 means a
+    per-publish counter, and on a 1 kHz millisecond clock it equals the publish period
+    in ms. The 2026-08-24 "999.6 Hz from tick" figure is therefore 999.6 TICKS per
+    second, and is only the publish rate if that tick is per-publish -- still unresolved.
+
+    The median is reported alongside p10 because the gap between them IS the drop
+    signal. Drops make deltas longer, so the median PERIOD rises and the median RATE
+    falls, while p10 stays near the true period. With no drops the two rates agree:
+    measured on a 118.4 Hz fixture, p10 gave 120.8 Hz and the median 118.7 Hz.
+
+    Returns (rate, method, ticks_per_s, ticks_per_sample, median_rate).
+    """
+    ticks_per_s = ticks_per_sample = None
+    if len(tick_list) >= 2 and span > 0.2:
+        delta = (tick_list[-1] - tick_list[0]) % (1 << 32)          # wrap-safe uint32
+        if 0 < delta < (1 << 31):
+            ticks_per_s = delta / span
+            if n_samples > 1:
+                ticks_per_sample = delta / (n_samples - 1)
+
+    if span <= 0.2:
+        return None, None, ticks_per_s, ticks_per_sample, None
+    if len(stamp_list) >= 8:
+        d = sorted(b - a for a, b in zip(stamp_list, stamp_list[1:]) if b > a)
+        if d:
+            p10 = d[max(0, int(0.10 * len(d)))]
+            med = d[len(d) // 2]
+            if p10 > 0:
+                med_rate = (1e9 / med) if med > 0 else None
+                return 1e9 / p10, "stamp", ticks_per_s, ticks_per_sample, med_rate
+    return None, None, ticks_per_s, ticks_per_sample, None
+
+
 def _verdict(topic, rows, expected_lowcmd_ip):
     """One line per topic, and whether it is a stop-the-session finding."""
     ips = sorted({r["ip"] for r in rows if r["ip"]})
     n = len(rows)
     if topic == "rt/arm_sdk":
-        if n:
+        # Gate on TRAFFIC, not on the endpoint existing. PC1 declares an idle rt/arm_sdk
+        # writer that publishes 0.0 Hz -- seen 2026-08-24 and again 2026-08-28. STOPping
+        # on `if n:` meant the census could never pass on this robot.
+        live = [r for r in rows if r["rate_hz"] > 0]
+        if live:
+            live_ips = sorted({r["ip"] for r in live if r["ip"]})
             return {"topic": topic, "stop": True,
-                    "text": f"-> STOP: rt/arm_sdk has {n} writer(s) from {ips}. Something is "
-                            f"in motion-control mode; this project never uses --motion."}
-        return {"topic": topic, "stop": False, "text": "-> OK: no writer (expected)."}
+                    "text": f"-> STOP: rt/arm_sdk is being WRITTEN by {len(live)} writer(s) "
+                            f"from {live_ips} at up to "
+                            f"{max(r['rate_hz'] for r in live):.1f} Hz. Something is in "
+                            f"motion-control mode; this project never uses --motion."}
+        if n:
+            return {"topic": topic, "stop": False,
+                    "text": f"-> OK: {n} declared writer(s) but 0.0 Hz -- PC1's idle "
+                            f"endpoint, expected on this robot."}
+        return {"topic": topic, "stop": False, "text": "-> OK: no writer."}
 
     if topic == "rt/lowcmd":
         if n == 0:
             return {"topic": topic, "stop": False,
                     "text": "-> OK: 0 writers (nothing is commanding the arms yet)."}
+        # Two DIFFERENT findings, previously conflated. The old branch fired on any
+        # address mismatch and printed "THIRD WRITER ... has 2 writers" in one sentence,
+        # because the writer COUNT was never consulted.
         foreign = [ip for ip in ips if ip != expected_lowcmd_ip]
+        live = [r for r in rows if r["rate_hz"] > 0]
+        findings = []
         if foreign:
-            return {"topic": topic, "stop": True,
-                    "text": f"-> THIRD WRITER {foreign} STOP: rt/lowcmd has {n} writers from "
-                            f"{ips}; only {expected_lowcmd_ip} (PC1) is expected."}
+            findings.append(f"FOREIGN SOURCE: rt/lowcmd is written from {foreign}, "
+                            f"expected only {expected_lowcmd_ip} (PC1)")
+        if n > EXPECTED_LOWCMD_WRITERS:
+            findings.append(f"UNEXPECTED WRITER COUNT: rt/lowcmd has {n} writers, "
+                            f"expected at most {EXPECTED_LOWCMD_WRITERS}")
+        if findings:
+            return {"topic": topic, "stop": True, "text": "-> STOP: " + "; ".join(findings)}
         return {"topic": topic, "stop": False,
-                "text": f"-> OK: {n} writer(s), all from {expected_lowcmd_ip}."}
+                "text": f"-> OK: {n} writer(s) ({len(live)} carrying traffic), all from "
+                        f"{expected_lowcmd_ip}."}
 
     if n == 0:
         return {"topic": topic, "stop": False, "text": "-> 0 writers."}
