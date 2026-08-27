@@ -58,15 +58,36 @@ class Inspire_Controller_DFX:
 
         logger_mp.info("Initialize Inspire_Controller_DFX OK!")
 
-    def _subscribe_hand_state(self):
-        while True:
-            hand_msg  = self.HandState_subscriber.Read()
-            if hand_msg is not None:
-                for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
-                    self.left_hand_state_array[idx] = hand_msg.states[id].q
-                for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
-                    self.right_hand_state_array[idx] = hand_msg.states[id].q
-            time.sleep(0.002)
+    def _on_state(self, side):
+        """[panthera] One callback per side: validate, record, and surface faults.
+
+        Anything raised in here happens on a DDS callback thread, where it would be
+        swallowed. It is stored instead and re-raised by the wait loop, so a dead
+        subscriber cannot look like "still waiting".
+        """
+        array = self.left_hand_state_array if side == "left" else self.right_hand_state_array
+
+        def handler(msg):
+            try:
+                n_dof, _ = hand_config.read_hand_counts(msg)
+                if side not in self._logged_first:
+                    self._logged_first.add(side)
+                    # The whole first message, once. On the next visit this is the first
+                    # real look at these hands -- err/status/temperature included, which
+                    # upstream reads and throws away.
+                    logger_mp.info(f"[Inspire_Controller_FTP] {side} hand first state: "
+                                   f"{hand_config.describe_state(msg)}")
+                hand_config.check_motor_count(side, n_dof)
+                hand_config.check_hand_health(side, msg)
+                with array.get_lock():
+                    for i in range(Inspire_Num_Motors):
+                        array[i] = msg.angle_act[i] / 1000.0
+                self._state_seen[side] = True
+            except BaseException as exc:
+                if self._subscribe_error is None:
+                    self._subscribe_error = exc
+
+        return handler
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """
@@ -158,10 +179,15 @@ class Inspire_Controller_DFX:
 
 
 
-kTopicInspireFTPLeftCommand   = "rt/inspire_hand/ctrl/l"
-kTopicInspireFTPRightCommand  = "rt/inspire_hand/ctrl/r"
-kTopicInspireFTPLeftState  = "rt/inspire_hand/state/l"
-kTopicInspireFTPRightState = "rt/inspire_hand/state/r"
+# [panthera] Topics and the expected DOF count come from hand_config, so the launcher's
+# pre-flight and this controller cannot disagree about which hand is fitted or where it
+# talks. The constant NAMES are kept so the rest of the upstream file is untouched.
+from teleop.robot_control import hand_config
+
+kTopicInspireFTPLeftCommand   = hand_config.TOPIC_LEFT_CMD
+kTopicInspireFTPRightCommand  = hand_config.TOPIC_RIGHT_CMD
+kTopicInspireFTPLeftState  = hand_config.TOPIC_LEFT_STATE
+kTopicInspireFTPRightState = hand_config.TOPIC_RIGHT_STATE
 
 class Inspire_Controller_FTP:
     def __init__(self, left_hand_array, right_hand_array, dual_hand_data_lock = None, dual_hand_state_array = None,
@@ -185,32 +211,58 @@ class Inspire_Controller_FTP:
         self.RightHandCmd_publisher = ChannelPublisher(kTopicInspireFTPRightCommand, inspire_dds.inspire_hand_ctrl)
         self.RightHandCmd_publisher.Init()
 
-        # Initialize hand state subscribers
-        self.LeftHandState_subscriber = ChannelSubscriber(kTopicInspireFTPLeftState, inspire_dds.inspire_hand_state)
-        self.LeftHandState_subscriber.Init() # Consider using callback if preferred: Init(callback_func, period_ms)
-        self.RightHandState_subscriber = ChannelSubscriber(kTopicInspireFTPRightState, inspire_dds.inspire_hand_state)
-        self.RightHandState_subscriber.Init()
-
         # Shared Arrays for hand states ([0,1] normalized values)
         self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)
         self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
 
-        # Initialize subscribe thread
-        self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
-        self.subscribe_state_thread.daemon = True
-        self.subscribe_state_thread.start()
+        # [panthera] Readiness and fault state, filled by the callbacks below.
+        self._state_seen = {}
+        self._logged_first = set()
+        self._subscribe_error = None
 
-        # Wait for initial DDS messages (optional, but good for ensuring connection)
-        wait_count = 0
-        while not (any(self.left_hand_state_array) or any(self.right_hand_state_array)):
-            if wait_count % 100 == 0: # Print every second
-                logger_mp.info(f"[Inspire_Controller_FTP] Waiting to subscribe to hand states from DDS (L: {any(self.left_hand_state_array)}, R: {any(self.right_hand_state_array)})...")
-            time.sleep(0.01)
-            wait_count += 1
-            if wait_count > 500: # Timeout after 5 seconds
-                logger_mp.warning("[Inspire_Controller_FTP] Warning: Timeout waiting for initial hand states. Proceeding anyway.")
+        # [panthera] Callback subscribers, not the polling thread upstream used. A bare
+        # ChannelSubscriber.Read() maps to cyclonedds take_one(), which BLOCKS FOREVER on
+        # a silent topic -- so upstream's loop would hang on the left hand and never even
+        # look at the right one. Init(handler) has neither problem.
+        self.LeftHandState_subscriber = ChannelSubscriber(kTopicInspireFTPLeftState, inspire_dds.inspire_hand_state)
+        self.LeftHandState_subscriber.Init(self._on_state("left"))
+        self.RightHandState_subscriber = ChannelSubscriber(kTopicInspireFTPRightState, inspire_dds.inspire_hand_state)
+        self.RightHandState_subscriber.Init(self._on_state("right"))
+
+        # [panthera] Fail closed. Upstream waited 5 s, logged "Proceeding anyway" and
+        # carried on, and was satisfied by EITHER side (`or`). Three problems:
+        #
+        #  1. Proceeding without a hand means the first command goes to a hand whose
+        #     position is unknown -- the controller's idea of "current" is all zeros.
+        #  2. `any()` cannot tell "no data" from "a hand reporting all zeros", and on an
+        #     RH56 all-zeros is a REAL pose: angle 0 is fully bent. A closed hand would
+        #     have looked like a missing one forever.
+        #  3. One side is not enough. Teleoperating with one hand silently dead is worse
+        #     than not starting.
+        #
+        # Readiness is now "a valid first state arrived on each side", on a monotonic
+        # deadline, and the wait raises instead of shrugging.
+        logger_mp.info(hand_config.describe())
+        deadline = time.monotonic() + hand_config.STATE_TIMEOUT_S
+        last_warning = 0.0
+        while True:
+            if self._subscribe_error is not None:
+                raise self._subscribe_error
+            if self._state_seen.get("left") and self._state_seen.get("right"):
                 break
-        logger_mp.info("[Inspire_Controller_FTP] Initial hand states received or timeout.")
+            if time.monotonic() >= deadline:
+                raise hand_config.state_timeout_error(
+                    "[Inspire_Controller_FTP]", hand_config.STATE_TIMEOUT_S,
+                    self._state_seen)
+            if time.monotonic() - last_warning >= 1.0:
+                last_warning = time.monotonic()
+                logger_mp.warning(
+                    f"[Inspire_Controller_FTP] waiting for hand state "
+                    f"(L: {bool(self._state_seen.get('left'))}, "
+                    f"R: {bool(self._state_seen.get('right'))})... "
+                    f"({deadline - time.monotonic():.0f}s left)")
+            time.sleep(0.01)
+        logger_mp.info("[Inspire_Controller_FTP] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array, right_hand_array, self.left_hand_state_array, self.right_hand_state_array,
                                                                           dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, xr_motion_data_ready_in))

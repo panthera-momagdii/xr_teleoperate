@@ -26,19 +26,67 @@ logger_mp = logging_mp.getLogger(__name__)
 # --- topics ----------------------------------------------------------------
 # Default is what the wire showed on our G1 on 2026-08-24, NOT the PR's "rt/dex5".
 # Override with DEX5_TOPIC_PREFIX=rt/dex5 if a firmware update moves them.
+# --- which hand is fitted ---------------------------------------------------
+# The G1 carries Inspire RH56E2-T1 hands (labels read 2026-08-27), not the Dex5-1P this
+# module was first written for. The Dex5 lane is kept, not deleted: PR #321 remains
+# useful if a Dex5 ever arrives, and deleting a verified path to make room for a new one
+# loses the verification. Nothing Dex5 runs unless HAND_MODEL says so.
+HAND_MODEL = os.environ.get("HAND_MODEL", "inspire_ftp").strip().lower()
+
+MODELS = {
+    "inspire_ftp": {
+        "label": "Inspire RH56E2-T1 (Modbus TCP via the inspire_sdkpy bridge)",
+        "left_cmd": "rt/inspire_hand/ctrl/l",
+        "right_cmd": "rt/inspire_hand/ctrl/r",
+        "left_state": "rt/inspire_hand/state/l",
+        "right_state": "rt/inspire_hand/state/r",
+        # 6 actuators; the hand has 12 joints, mechanically coupled.
+        "num_joints": 6,
+        # RH56DFTP manual: TEMP(m) at register 1618, one byte per DOF, degrees C.
+        "temp_limit_c": 45.0,
+        "touch_topics": ("rt/inspire_hand/touch/l", "rt/inspire_hand/touch/r"),
+    },
+    "dex5": {
+        "label": "Unitree Dex5-1P (parked -- not the hand on this robot)",
+        "left_cmd": None, "right_cmd": None, "left_state": None, "right_state": None,
+        "num_joints": 20,
+        "temp_limit_c": 45.0,
+        "touch_topics": (),
+    },
+}
+if HAND_MODEL not in MODELS:
+    raise RuntimeError(
+        f"HAND_MODEL={HAND_MODEL!r} is not one of {sorted(MODELS)}. "
+        f"This robot's hands are Inspire RH56E2-T1 -> 'inspire_ftp'.")
+
+_MODEL = MODELS[HAND_MODEL]
+
 TOPIC_PREFIX = os.environ.get("DEX5_TOPIC_PREFIX", "rt/dex3")
 
-TOPIC_LEFT_CMD    = f"{TOPIC_PREFIX}/left/cmd"
-TOPIC_RIGHT_CMD   = f"{TOPIC_PREFIX}/right/cmd"
-TOPIC_LEFT_STATE  = f"{TOPIC_PREFIX}/left/state"
-TOPIC_RIGHT_STATE = f"{TOPIC_PREFIX}/right/state"
+if HAND_MODEL == "dex5":
+    TOPIC_LEFT_CMD    = f"{TOPIC_PREFIX}/left/cmd"
+    TOPIC_RIGHT_CMD   = f"{TOPIC_PREFIX}/right/cmd"
+    TOPIC_LEFT_STATE  = f"{TOPIC_PREFIX}/left/state"
+    TOPIC_RIGHT_STATE = f"{TOPIC_PREFIX}/right/state"
+else:
+    # Fixed by the bridge, not by a prefix: inspire_sdkpy publishes rt/inspire_hand/*.
+    TOPIC_LEFT_CMD    = _MODEL["left_cmd"]
+    TOPIC_RIGHT_CMD   = _MODEL["right_cmd"]
+    TOPIC_LEFT_STATE  = _MODEL["left_state"]
+    TOPIC_RIGHT_STATE = _MODEL["right_state"]
+
+# Tactile. The bridge publishes these; nothing in xr_teleoperate subscribes to them yet.
+# T1 is the 17-sensor resistive option, and inspire_hand_touch carries 17 regions. Wiring
+# them into the recorder as an extra column is a deliberate future step -- see
+# docs/inspire_rh56e2.md -- not something to switch on the day the hands first stream.
+TOPIC_TOUCH = _MODEL["touch_topics"]
 
 
 # --- joint count -----------------------------------------------------------
 # Dex5-1P has 20 motors per hand; a Dex3-1 reports 7. The controller refuses to
 # run on a mismatch (see Dex5_1_Controller._subscribe_hand_state) rather than
 # silently driving the wrong hand.
-NUM_JOINTS_EXPECTED = 20
+NUM_JOINTS_EXPECTED = _MODEL["num_joints"]
 
 _NUM_JOINTS_ENV = os.environ.get("DEX5_NUM_JOINTS")
 if _NUM_JOINTS_ENV is not None:
@@ -55,11 +103,12 @@ if _NUM_JOINTS_ENV is not None:
 # --- timeouts and limits ---------------------------------------------------
 # How long Dex5_1_Controller waits for the first HandState_ on BOTH sides before
 # giving up. Measured on monotonic time, never wall clock.
-STATE_TIMEOUT_S = float(os.environ.get("DEX5_STATE_TIMEOUT_S", "10"))
+STATE_TIMEOUT_S = float(os.environ.get("HAND_STATE_TIMEOUT_S",
+                                       os.environ.get("DEX5_STATE_TIMEOUT_S", "10")))
 
 # Abort threshold for the operator tools. Not a firmware limit -- a conservative
 # bench number until we have real thermal data from the hands.
-TEMP_LIMIT_C = 45.0
+TEMP_LIMIT_C = float(os.environ.get("HAND_TEMP_LIMIT_C", _MODEL["temp_limit_c"]))
 
 
 # --- gains -----------------------------------------------------------------
@@ -109,10 +158,114 @@ def read_hand_counts(msg):
 
     Both fields are IDL `sequence`s, so their length is whatever the hand actually
     published -- this is the measurement that tells us Dex5-1P (20) from Dex3-1 (7).
+
+    An Inspire inspire_hand_state has no motor_state at all -- its per-DOF array is
+    `angle_act` and it carries no press_sensor_state -- so the same accessor answers for
+    both hands and the callers do not have to know which is fitted.
     """
+    if hasattr(msg, "angle_act"):                       # Inspire RH56
+        return (len(msg.angle_act) if msg.angle_act is not None else 0), 0
     n_motor = len(msg.motor_state) if msg.motor_state is not None else 0
     n_press = len(msg.press_sensor_state) if msg.press_sensor_state is not None else 0
     return n_motor, n_press
+
+
+# RH56 error bits, from the RH56DFTP manual section 2.6.18 and confirmed against
+# inspire_sdkpy's own error_descriptions table.
+ERROR_BITS = {
+    0: "locked rotor",
+    1: "over temperature",
+    2: "overcurrent",
+    3: "abnormal motor operation",
+    4: "communication error",
+}
+ERROR_OVER_TEMPERATURE = 1 << 1
+
+# DOF order, RH56DFTP manual. Same order as the DDS arrays and as
+# Inspire_*_Hand_JointIndex.
+DOF_NAMES = ("little", "ring", "middle", "index", "thumb bend", "thumb rotation")
+
+
+def decode_error(value):
+    """Bit-decode one RH56 ERROR(m) byte into human-readable causes."""
+    value = int(value)
+    names = [n for bit, n in ERROR_BITS.items() if value & (1 << bit)]
+    return names or [f"unknown code 0x{value:02x}"]
+
+
+def hand_health_error(side, msg, temp_limit_c=None):
+    """Return a RuntimeError if this state message reports a hand that must not be used.
+
+    Two refusals, both from fields upstream reads and discards:
+
+      err != 0        the hand itself is reporting a fault. RH56 register ERROR(m) at
+                      1618-6=1606, one byte per DOF, bit-coded. Any non-zero byte means
+                      that DOF is not in a state to be commanded.
+      over-temperature TEMP(m) at 1618, degrees C per DOF.
+
+    Checked BEFORE Enter_Debug_Mode, so a faulted or hot hand stops the session while the
+    robot still has its own controller.
+    """
+    if temp_limit_c is None:
+        temp_limit_c = TEMP_LIMIT_C
+
+    err = list(getattr(msg, "err", []) or [])
+    bad = [i for i, e in enumerate(err) if int(e) != 0]
+    if bad:
+        detail = "; ".join(f"DOF {i} ({DOF_NAMES[i] if i < len(DOF_NAMES) else '?'}) "
+                           f"0x{int(err[i]):02x} = {'+'.join(decode_error(err[i]))}"
+                           for i in bad)
+        # CLEAR_ERROR does NOT clear an over-temperature fault. The manual is explicit:
+        # "The over temperature error of the actuator is not clearable. When the
+        # temperature falls, such error will be cleared automatically." Advising an
+        # operator to write CLEAR_ERROR at a hot hand would have them writing to a
+        # register that cannot help, and then wondering why.
+        clearable = any(int(e) & ~ERROR_OVER_TEMPERATURE for e in err if int(e))
+        overtemp = any(int(e) & ERROR_OVER_TEMPERATURE for e in err if int(e))
+        advice = []
+        if overtemp:
+            advice.append("the over-temperature bit is NOT clearable -- it clears itself "
+                          "when the actuator cools, so wait, do not write CLEAR_ERROR")
+        if clearable:
+            advice.append("the other bits are clearable with CLEAR_ERROR (register 1004) "
+                          "ONCE THE CAUSE IS KNOWN -- clearing a locked rotor and "
+                          "commanding it again is how a finger gets damaged")
+        return RuntimeError(
+            f"{side}: hand reports a fault -- {detail}. Commanding it is not safe. "
+            + ". ".join(advice) + ".")
+
+    temps = [int(t) for t in (getattr(msg, "temperature", []) or [])]
+    if temps and max(temps) > temp_limit_c:
+        hot = [i for i, t in enumerate(temps) if t > temp_limit_c]
+        return RuntimeError(
+            f"{side}: hand over temperature -- DOF {hot} "
+            f"({', '.join(DOF_NAMES[i] for i in hot if i < len(DOF_NAMES))}) at "
+            f"{[temps[i] for i in hot]} C, limit {temp_limit_c} C (env "
+            f"HAND_TEMP_LIMIT_C). This limit is OURS: the RH56DFTP manual states no "
+            f"operating or protection temperature, only that TEMP(m) reads 0-100 C and "
+            f"that the actuator raises its own over-temperature ERROR bit. 45 C is a "
+            f"conservative early warning ahead of the hand's own protection. Let it cool.")
+    return None
+
+
+def check_hand_health(side, msg, temp_limit_c=None):
+    """Raise if the hand reports a fault or is over temperature. Fail closed."""
+    exc = hand_health_error(side, msg, temp_limit_c)
+    if exc is not None:
+        raise exc
+
+
+def describe_state(msg):
+    """One-line summary of a hand state message, for the log-once evidence line."""
+    if hasattr(msg, "angle_act"):
+        parts = []
+        for f in ("angle_act", "force_act", "current", "err", "status", "temperature"):
+            v = getattr(msg, f, None)
+            if v is not None:
+                parts.append(f"{f}={[int(x) for x in v]}")
+        return "  ".join(parts)
+    n_motor, n_press = read_hand_counts(msg)
+    return f"motor_state={n_motor} press_sensor_state={n_press}"
 
 
 def motor_temperature(motor_state):
@@ -155,24 +308,59 @@ def check_motor_count(side, n_motor, expected=None):
 def state_timeout_error(who, timeout_s, seen):
     """The single wording for "no hand state arrived in time".
 
-    `who` is the tag of the caller so a log line says which check gave up; the body --
-    both topics, the per-interface discovery note, the three causes -- is identical
-    wherever it is raised.
+    `who` is the tag of the caller so a log line says which check gave up. The causes are
+    model-specific and must be: for the Inspire hands the usual answer is that the
+    Modbus-TCP<->DDS bridge on PC2 is not running, and advising an operator to check
+    DEX5_TOPIC_PREFIX would send them somewhere that cannot help.
     """
+    saw = sorted(seen) or "nothing"
+    head = (f"{who} no hand state on {TOPIC_LEFT_STATE} / {TOPIC_RIGHT_STATE} "
+            f"within {timeout_s}s (saw: {saw}). "
+            "Note that DDS discovery is per network interface -- the launcher's "
+            "--network-interface must be the one the hands are on. ")
+    if HAND_MODEL == "dex5":
+        return RuntimeError(head + "Three usual causes: "
+                            "(1) the hands are unpowered or have not enumerated on the bus; "
+                            "(2) wrong DDS domain or interface; "
+                            f"(3) wrong topic prefix -- DEX5_TOPIC_PREFIX is currently "
+                            f"'{TOPIC_PREFIX}', try the other of rt/dex3 or rt/dex5.")
     return RuntimeError(
-        f"{who} no HandState_ on {TOPIC_LEFT_STATE} / "
-        f"{TOPIC_RIGHT_STATE} within {timeout_s}s "
-        f"(saw: {sorted(seen) or 'nothing'}). "
-        "Note that DDS discovery is per network interface -- the launcher's "
-        "--network-interface must be the one the hands are on. Three usual causes: "
-        "(1) the hands are unpowered or have not enumerated on the bus; "
-        "(2) wrong DDS domain or interface; "
-        f"(3) wrong topic prefix -- DEX5_TOPIC_PREFIX is currently "
-        f"'{TOPIC_PREFIX}', try the other of rt/dex3 or rt/dex5.")
+        head + "These topics are produced by the Modbus-TCP<->DDS bridge on PC2, NOT by "
+        "PC1, so silence usually means the bridge is not running rather than that the "
+        "hands are faulty. Four usual causes: "
+        "(1) the bridge is not started on PC2 (see docs/next_visit_pc2.md); "
+        "(2) the bridge is running but pointed at the wrong hand address -- ours answer "
+        "on 192.168.123.210 and .211, not the factory default 192.168.11.210; "
+        "(3) wrong DDS domain or interface; "
+        "(4) the hands are unpowered -- their power LED reads green when they ARE "
+        "powered, and both were green on 2026-08-27.")
+
+
+def state_type():
+    """The DDS type of this model's hand state message.
+
+    Imported lazily and per model, so that importing hand_config still needs neither the
+    Unitree channel machinery nor inspire_sdkpy -- the read-only probe and the tools rely
+    on that, and on a laptop without the bridge installed the Dex5 lane must still work.
+    """
+    if HAND_MODEL == "dex5":
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+        return HandState_
+    from inspire_sdkpy import inspire_dds
+    return inspire_dds.inspire_hand_state
+
+
+def ctrl_type():
+    """The DDS type of this model's hand command message."""
+    if HAND_MODEL == "dex5":
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_
+        return HandCmd_
+    from inspire_sdkpy import inspire_dds
+    return inspire_dds.inspire_hand_ctrl
 
 
 def preflight(timeout_s=None, log=None):
-    """Confirm both hands are streaming a Dex5-1P-shaped state. Read-only.
+    """Confirm BOTH hands are streaming a state of the expected shape. Read-only.
 
     Called by the launcher BEFORE MotionSwitcher().Enter_Debug_Mode(), so that a wrong
     or missing hand stops the session while the robot still has its own controller.
@@ -193,7 +381,7 @@ def preflight(timeout_s=None, log=None):
     # DDS machinery -- the read-only probe and the tools rely on that.
     import gc
     from unitree_sdk2py.core.channel import ChannelSubscriber
-    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+    HandState_ = state_type()
 
     if timeout_s is None:
         timeout_s = STATE_TIMEOUT_S
@@ -211,9 +399,12 @@ def preflight(timeout_s=None, log=None):
             try:
                 n_motor, n_press = read_hand_counts(msg)
                 counts[side] = {"n_motor": n_motor, "n_press": n_press}
+                # The whole first message, once per side. This is the hardware evidence
+                # line: on the next visit it is the first real look at these hands.
                 log.info(f"[hand preflight] {side} hand first state: "
-                         f"motor_state={n_motor} press_sensor_state={n_press}")
+                         f"{describe_state(msg)}")
                 check_motor_count(side, n_motor)
+                check_hand_health(side, msg)
                 seen[side] = True
             except BaseException as exc:      # surfaced by the wait loop below
                 error.setdefault("exc", exc)
@@ -283,17 +474,33 @@ def make_hand_cmd(n_joints=NUM_JOINTS_EXPECTED, gains=None, thumb_base_index=THU
 def describe():
     """One-block summary of the effective config, for logs and tool banners."""
     overridden = " (OVERRIDDEN by DEX5_NUM_JOINTS)" if _NUM_JOINTS_ENV is not None else ""
-    return (
-        "[hand_config] effective Dex5-1P configuration\n"
-        f"  topic prefix     : {TOPIC_PREFIX}   (env DEX5_TOPIC_PREFIX)\n"
-        f"    left  cmd/state: {TOPIC_LEFT_CMD} | {TOPIC_LEFT_STATE}\n"
-        f"    right cmd/state: {TOPIC_RIGHT_CMD} | {TOPIC_RIGHT_STATE}\n"
-        f"  motors expected  : {NUM_JOINTS_EXPECTED}{overridden}   (7 would mean a Dex3-1 is fitted)\n"
-        f"  state timeout    : {STATE_TIMEOUT_S} s   (env DEX5_STATE_TIMEOUT_S)\n"
-        f"  temp limit       : {TEMP_LIMIT_C} C\n"
-        f"  gains            : finger kp/kd {GAINS['finger'][0]}/{GAINS['finger'][1]}, "
-        f"thumb kp/kd {GAINS['thumb'][0]}/{GAINS['thumb'][1]} (thumb slots >= {THUMB_BASE_INDEX})\n"
-        f"  max step         : {DEX5_MAX_STEP_RAD} rad/cycle   (env DEX5_MAX_STEP_RAD; "
-        f"{DEX5_MAX_STEP_RAD * 100.0:g} rad/s at 100 Hz)\n"
-        f"  limit margin     : {DEX5_LIMIT_MARGIN_RAD} rad   (env DEX5_LIMIT_MARGIN_RAD)"
-    )
+    lines = [
+        "[hand_config] effective hand configuration",
+        f"  hand model       : {HAND_MODEL}   (env HAND_MODEL)",
+        f"                     {_MODEL['label']}",
+        f"    left  cmd/state: {TOPIC_LEFT_CMD} | {TOPIC_LEFT_STATE}",
+        f"    right cmd/state: {TOPIC_RIGHT_CMD} | {TOPIC_RIGHT_STATE}",
+        f"  DOF expected     : {NUM_JOINTS_EXPECTED}{overridden}",
+        f"  state timeout    : {STATE_TIMEOUT_S} s   (env HAND_STATE_TIMEOUT_S)",
+        f"  temp limit       : {TEMP_LIMIT_C} C   (env HAND_TEMP_LIMIT_C)",
+    ]
+    if HAND_MODEL == "dex5":
+        lines += [
+            f"  topic prefix     : {TOPIC_PREFIX}   (env DEX5_TOPIC_PREFIX)",
+            f"  gains            : finger kp/kd {GAINS['finger'][0]}/{GAINS['finger'][1]}, "
+            f"thumb kp/kd {GAINS['thumb'][0]}/{GAINS['thumb'][1]} "
+            f"(thumb slots >= {THUMB_BASE_INDEX})",
+            f"  max step         : {DEX5_MAX_STEP_RAD} rad/cycle   (env DEX5_MAX_STEP_RAD; "
+            f"{DEX5_MAX_STEP_RAD * 100.0:g} rad/s at 100 Hz)",
+            f"  limit margin     : {DEX5_LIMIT_MARGIN_RAD} rad   (env DEX5_LIMIT_MARGIN_RAD)",
+        ]
+    else:
+        lines += [
+            "  DOF order        : 0 little, 1 ring, 2 middle, 3 index, 4 thumb bend, "
+            "5 thumb rotation   (RH56DFTP manual)",
+            "  angle semantics  : 0-1000 on the wire, 1000 = fully open, 0 = fully bent",
+            f"  touch topics     : {list(TOPIC_TOUCH) or 'none'}",
+            "                     published by the bridge; NOT subscribed by xr_teleoperate "
+            "yet -- see docs/inspire_rh56e2.md",
+        ]
+    return "\n".join(lines)

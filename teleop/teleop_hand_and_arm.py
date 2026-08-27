@@ -134,7 +134,9 @@ if __name__ == '__main__':
         #
         # The controller keeps its own identical check: this is defence in depth, not a
         # replacement. preflight() closes its subscribers before returning.
-        if args.ee == "dex5":
+        # dex5 is the parked lane; inspire_ftp is the hand actually fitted. Both refuse
+        # here rather than after the release.
+        if args.ee in ("dex5", "inspire_ftp"):
             hand_config.preflight(log=logger_mp)
 
         # ipc communication mode. client usage: see utils/ipc.py
