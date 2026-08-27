@@ -1,5 +1,36 @@
 # panthera/dex5-1p — offline preparation
 
+> ## ERRATUM — 2026-08-27: the hand model was wrong
+>
+> This document was written for a **Unitree Dex5-1P**. The G1's hands are **Inspire
+> RH56E2-T1**, read from the labels at the wrist ring: right `RH56E2-2R-T1`
+> SN `411AA1A04140021`, left `RH56E2-2L-T1` SN `401AA1A0416??01` (two characters
+> illegible in the photo — unconfirmed). They are driven over **Modbus TCP from PC2**,
+> not by Unitree's dex3 DDS protocol at all.
+>
+> **What this closes.** The "silent hands" of 2026-08-24 and 2026-08-27 were the wrong
+> hand model, not a fault. PC1's `g1_dex_protocol_v2.0` declares `rt/dex3/*` and
+> `rt/lf/dex3/*`; all four produced zero samples because there is no Unitree hand
+> attached to answer them. A grep for `dex5|dex1/|hand_sdk|inspire|brainco` across all 89
+> topics PC1 publishes returns 0, so it was not a namespace mistake either. No Unitree
+> ticket.
+>
+> **What changed.** The live path is `--ee inspire_ftp` → `Inspire_Controller_FTP`, 6 DOF
+> per hand, topics `rt/inspire_hand/{ctrl,state}/{l,r}`, served by a Modbus-TCP↔DDS
+> bridge that **must be installed on PC2 and is not there yet**. See
+> [`inspire_rh56e2.md`](inspire_rh56e2.md) for the hand and toolchain, and
+> [`next_visit_pc2.md`](next_visit_pc2.md) for the install.
+>
+> **What is parked, not deleted.** Everything Dex5 — PR #321, the `hand_config` dex5
+> model, the clamp/slew limiter, the four Dex5 tests, the assets. `--ee dex5` still
+> parses and `HAND_MODEL=dex5` still passes its tests. PR #321 is verified work and
+> remains useful if a Dex5 ever arrives; deleting a verified path to make room for a new
+> one loses the verification. Nothing Dex5 runs unless it is selected.
+>
+> Sections below that say "Dex5" and are **not** marked parked describe machinery that
+> now applies to whichever hand `HAND_MODEL` selects.
+
+
 Branch `panthera/dex5-1p` = upstream `xr_teleoperate@845b25a` + PR #321 (`39b79bc`,
 "[feat] Add Unitree Dex5-1 support", meiander) + eight Panthera changes.
 
@@ -25,6 +56,12 @@ no DDS domain 0**. Everything below was measured on this machine unless marked *
 | g11 | This document's exit/state sections | `docs/` |
 | g12 | Clamp + slew limit on hand targets | `hand_config.py`, `robot_hand_unitree.py`, `tools/{fake_hand_state,test_dex5_clamp_slew}.py`, `docs/` |
 | g13 | Two read-only visit tools: DDS census, Quest link check | `tools/{domain0_census,quest_link_check}.py`, `docs/` |
+| g14a | PC2 contract readback — hands are Inspire RH56E2-T1 | `docs/g1_contract.yaml` |
+| g14b | The Inspire toolchain, sourced | `docs/inspire_rh56e2.md` |
+| g14c | Fail-closed on the Inspire path, before ReleaseMode | `hand_config.py`, `robot_hand_inspire.py`, `teleop_hand_and_arm.py`, `tools/inspire_probe.py` |
+| g14d | IK URDF hand mass 1.10 → 0.79 kg per side | `assets/g1/g1_body29_hand14.urdf` |
+| g14e | Census: false STOP fixed, rates derived, temperatures reported | `tools/{domain0_census,fake_inspire_state}.py` |
+| g14f | This rename and erratum; the next-visit plan | `docs/` |
 
 ### The two G1 conflict resolutions
 
@@ -170,24 +207,30 @@ XR_ARM_VEL_LIMIT=5 python teleop_hand_and_arm.py \
     --img-server-ip 192.168.123.164
 ```
 
-**Arms + Dex5-1P hands:**
+**Arms + Inspire RH56E2-T1 hands** (the hands actually fitted). The bridge must already
+be running on PC2 — without it these topics are silent and the pre-flight refuses:
 
 ```bash
-XR_ARM_VEL_LIMIT=5 DEX5_TOPIC_PREFIX=rt/dex3 python teleop_hand_and_arm.py \
-    --arm G1_29 --ee dex5 \
+XR_ARM_VEL_LIMIT=5 HAND_MODEL=inspire_ftp python teleop_hand_and_arm.py \
+    --arm G1_29 --ee inspire_ftp \
     --network-interface "$NIC" \
     --img-server-ip 192.168.123.164
 ```
+
+`HAND_MODEL=inspire_ftp` is the default, so it is shown for explicitness rather than
+necessity. **Arms + Dex5 (parked — not this robot):** `HAND_MODEL=dex5 … --ee dex5`.
 
 Environment variables the hand path reads:
 
 | variable | default | what it does |
 |---|---|---|
-| `DEX5_TOPIC_PREFIX` | `rt/dex3` | hand DDS topic prefix; try `rt/dex5` if the topics move |
-| `DEX5_MAX_STEP_RAD` | `0.05` | max change per joint per control cycle. At 100 Hz that is 5 rad/s. Raise only with a reason; `10` effectively disables the limiter |
-| `DEX5_LIMIT_MARGIN_RAD` | `0.001` | URDF limits are shrunk by this before clamping, so a command never sits on a mechanical stop |
-| `DEX5_STATE_TIMEOUT_S` | `10` | how long the pre-flight and the controller wait for the first hand state |
-| `DEX5_NUM_JOINTS` | `20` | **bench only.** Overrides the fail-closed motor count. Never on the robot |
+| `HAND_MODEL` | `inspire_ftp` | which hand is fitted. `inspire_ftp` = Inspire RH56E2-T1 (6 DOF, `rt/inspire_hand/*`); `dex5` = the parked Dex5 lane (20 DOF, `rt/dex3/*`) |
+| `HAND_STATE_TIMEOUT_S` | `10` | how long the pre-flight and controller wait for the first hand state on **each** side |
+| `HAND_TEMP_LIMIT_C` | `45` | per-DOF hand temperature above which the pre-flight refuses. **Ours, not Inspire's** — see below |
+| `DEX5_TOPIC_PREFIX` | `rt/dex3` | **dex5 lane only.** Ignored for Inspire, whose topic names are fixed by the bridge |
+| `DEX5_MAX_STEP_RAD` | `0.05` | **dex5 lane only (parked).** Max change per joint per control cycle |
+| `DEX5_LIMIT_MARGIN_RAD` | `0.001` | **dex5 lane only (parked).** URDF limits shrunk by this before clamping |
+| `DEX5_NUM_JOINTS` | `20` | **bench only, dex5 lane.** Overrides the fail-closed count. Never on the robot |
 | `XR_ARM_VEL_LIMIT` | `30.0` | arm joint velocity limit, rad/s. Hardware sessions use `5` |
 
 ### What the hand actually receives, and what gets recorded
@@ -224,11 +267,13 @@ design (the simulator ships a Dex3 hand only).
    **The rule stands: never start the launcher without `--sim` on the robot LAN unless
    you intend debug mode.**
 
-2. **The hand pre-flight runs first, at launcher start.** With `--ee dex5`,
-   `hand_config.preflight()` is called immediately after `ChannelFactoryInitialize` —
-   before the image client, before `MotionSwitcher`, and long before
-   `Dex5_1_Controller`. If the hands are silent or report 7 motors, the launcher
-   **exits 1 before `ReleaseMode()`, having moved nothing**: the robot still has its own
+2. **The hand pre-flight runs first, at launcher start.** With `--ee inspire_ftp` (or the
+   parked `--ee dex5`), `hand_config.preflight()` is called immediately after
+   `ChannelFactoryInitialize` —
+   before the image client, before `MotionSwitcher`, and long before the hand
+   controller. It refuses on any of four conditions — **either** side silent, the wrong
+   DOF count, `err != 0` on any DOF, or any DOF above `HAND_TEMP_LIMIT_C` — and the
+   launcher then **exits 1 before `ReleaseMode()`, having moved nothing**: the robot still has its own
    controller, debug mode was never entered, and no go-home is attempted. Before this,
    the same refusal came from the controller, i.e. after the release, and cost a go-home
    with the arms limp and debug mode left active.
@@ -255,7 +300,9 @@ Every tool defaults to `--domain 1` so a mistyped command cannot reach the robot
 |---|---|---|
 | `tools/domain0_census.py` | **read-only.** Who is on the domain, and who writes `rt/lowstate`, `rt/lowcmd`, `rt/arm_sdk` and the two hand state topics — per-writer GUID, IP and rate, plus whether all writers agree on the message type | 0 all verdicts OK · 3 a STOP verdict fired · 4 the domain is empty apart from the tool |
 | `tools/quest_link_check.py` | **no DDS at all.** Brings up televuer exactly as the launcher does, prints the headset URL per local IP, and streams head/wrist/`motion_data_ready`/pinch once connected | 0 connected and hands tracked · 2 nothing ever connected · 3 connected but `motion_data_ready` never went true |
-| `tools/hand_probe.py` | **read-only.** Hand state census: `n_motor`, `n_press`, the tactile index map, temperatures, the 4k+3 coupling hint | 0 both sides streamed · 3 a side was silent |
+| `tools/inspire_probe.py` | **read-only.** The Inspire hands: per side samples/s and min/max/last for `pos_act`, `angle_act`, `force_act`, `current`, `err`, `status`, `temperature`. Flags non-zero `err`, over-temperature and a wrong DOF width | 0 both sides streamed · 3 a side was silent |
+| `tools/fake_inspire_state.py` | Fixture. Synthetic `inspire_hand_state`, with `--err` and `--temp` to exercise the refusals | 0 |
+| `tools/hand_probe.py` | **read-only, dex5 lane (parked).** `n_motor`, `n_press`, the tactile index map, the 4k+3 coupling hint | 0 both sides streamed · 3 a side was silent |
 | `tools/hand_step.py` | **commands the hardware.** One-joint step response; interlocked behind `PANTHERA_HAND_CMD_OK=1` | 0 ok · 2 args/interlock · 3 no state · 4 thermal abort · 5 motor-count mismatch |
 | `tools/test_dex5_failclosed.py` | Exercises the pre-flight and controller refusal paths | 0 the case behaved as expected · 1 it did not |
 | `tools/fake_hand_state.py` | Test fixture. Publishes synthetic `HandState_`. Never on the robot's domain | 0 |
@@ -306,6 +353,63 @@ PANTHERA_HAND_CMD_OK=1 python tools/hand_step.py \
 
 `hand_step.py` exit codes: 0 ok · 2 args/interlock · 3 no state · 4 thermal abort ·
 5 motor-count mismatch.
+
+---
+
+## 4a. Temperature — the two stop conditions for B2
+
+### The hands
+
+The RH56DFTP manual states **no operating or protection temperature**. `TEMP(m)` (register
+1618, one byte per DOF) is documented only as reading `0–100 °C`, which is the register's
+range, not a limit. So `HAND_TEMP_LIMIT_C = 45` is **ours**, and it is labelled that way in
+the refusal text.
+
+What the manual *does* give is better than a number we would have guessed: **the actuator
+raises its own over-temperature error**, `ERROR(m)` bit 1. Our 45 °C is a conservative
+early warning sitting ahead of the hand's own protection, not a replacement for it.
+
+RH56 `ERROR(m)` bits — from the manual §2.6.18, cross-checked against `inspire_sdkpy`'s own
+`error_descriptions`:
+
+| bit | meaning | clearable by `CLEAR_ERROR` (register 1004)? |
+|---|---|---|
+| 0 | locked rotor | yes |
+| 1 | **over temperature** | **no — clears itself when the actuator cools** |
+| 2 | overcurrent | yes |
+| 3 | abnormal motor operation | yes |
+| 4 | communication error | yes |
+
+The pre-flight **never writes `CLEAR_ERROR`**. It decodes the bits and says which of them
+a human could clear, and that is the whole of its involvement — clearing a locked rotor
+and immediately commanding it again is how a finger gets damaged.
+
+### The arm — the shoulder-pitch stop condition
+
+`unitree_sdk2_python` issue #129 reports a G1 (ARM7) **with an Inspire FTP hand** losing
+its arm after the **shoulder pitch** motor overheated on `/arm_sdk`, at kp = 40, kd = 1.5.
+Same hand family as ours. The issue quotes **no temperature, and has no Unitree reply.**
+
+**We could not source a numeric limit.** Unitree publishes no arm-motor temperature limit
+in any documentation reachable from here — only a described "thermal derating" behaviour
+with no threshold. So the stop condition is built to not need one:
+
+| condition | action | why it needs no vendor number |
+|---|---|---|
+| shoulder pitch rises **> 10 °C in 5 min** | **stop, park the arms, let it cool** | a sustained rise at a fixed pose means the joint is not in thermal equilibrium; where it ends does not matter |
+| shoulder pitch **> 60 °C** | warn, shorten the session, watch it every minute | ours, conservative |
+| shoulder pitch **> 75 °C** | **stop** | ours, conservative |
+| any joint's `err`/derating behaviour changes | stop | the robot's own protection is the authority |
+
+The absolute numbers are `ARM_TEMP_WARN_C` / `ARM_TEMP_STOP_C` in `tools/domain0_census.py`
+and are **ours, not Unitree's**. The nearest independent datapoint is a third-party G1
+report of ankle roll reaching 90 °C and being treated as a fault. **Getting the real limit
+from Unitree is an open item for the next visit.**
+
+Why shoulder pitch and not another joint: it carries the largest gravity feed-forward of
+any arm joint (−5.57 N·m at the reach pose with the RH56E2 mass, against −3.48 at the
+elbow). Run the census before and after B2 and compare — `domain0_census.py` reports the
+max per joint over its window.
 
 ---
 
@@ -383,6 +487,12 @@ the tool that answers it and where the answer goes.
 | counting DDS readers with `take()` | destructive — a closed reader looks identical to one that was never announced, so a leak check silently reports whatever it likes | use `read()` and filter `sample_info.instance_state` (ALIVE = 16, NOT_ALIVE_DISPOSED = 32) |
 | one `cyclonedds.domain.Domain` per domain id per process | building an observer participant before `ChannelFactoryInitialize` makes the SDK fail with "create domain error" | initialise the SDK factory first |
 | `MotorState_.temperature` | `array[int16, 2]`, not a scalar | `hand_config.motor_temperature()` returns the hotter of the two |
+| Inspire `angle_act` | `0` is a REAL pose (fully bent), not "no data" — so upstream's `any(state)` readiness check would treat a closed hand as a missing one forever | readiness is "a valid first state per side" |
+| upstream `Inspire_Controller_FTP` | failed open three ways: waited 5 s then "Proceeding anyway", accepted **either** side, and polled with a blocking `Read()` that hangs on a silent left topic and never reaches the right | all fixed in g14c |
+| RH56 over-temperature error | **not clearable by `CLEAR_ERROR`** — it clears itself when the actuator cools. The other four bits are clearable | never write `CLEAR_ERROR` at a hot hand; wait |
+| `inspire_sdkpy/__init__.py` | eagerly imports `ModbusDataHandler` **and** `qt_tabs`, so reaching the IDL drags in `pymodbus`, `pyqtgraph`, `PyQt5`, `colorcet`. No import path avoids it | budget for it on PC2 (headless aarch64), or patch the `__init__` |
+| Inspire hand default address | factory default is `192.168.11.210` **port 6000**, not Modbus's usual 502. Ours answer on `192.168.123.210/.211` | the PC2 report's "no TCP connect to port 502" guarded the wrong port |
+| `setup_uvc.sh` on PC2 | unloads `uvcvideo`, which the stock `videohub_pc4` streams depend on | **never run it on PC2** |
 | a DDS writer created before a `fork` | writes from the child are invisible to a subscriber in the **parent** (measured 0 samples), but reach any other process fine (200/200). `Dex5_1_Controller` does exactly this | put test subscribers in a separate process; do not conclude the controller is mute |
 | `subprocess.Popen` from a DDS-initialised process | the exec'd child receives nothing on this build; the same command from a shell receives ~930 over the same window | start helper subscribers **before** this process calls `ChannelFactoryInitialize` |
 | comparing commanded q read back off the wire | float32: a value clamped exactly to a bound returns a few 1e-8 past it | compare with a ~1e-6 rad tolerance, not exact |
