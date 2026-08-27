@@ -1,7 +1,7 @@
 # for dex3-1
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_                               # idl
-from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_, unitree_hg_msg_dds__MotorCmd_
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
 # for gripper
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_                           # idl
@@ -18,6 +18,7 @@ from multiprocessing import Process, Array, Value, Lock
 parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent2_dir)
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.robot_control import hand_config
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 import logging_mp
@@ -26,16 +27,20 @@ logger_mp = logging_mp.getLogger(__name__)
 
 # 20 DDS URDF joint indices drive 16 physical motors; the firmware does the joint->motor
 # transform, so commands and states are indexed by joint, not by motor.
-Dex5_Num_Joints = 20
-Dex5_Thumb_Base_Index = 16
+#
+# [panthera] These constants keep the PR's names -- so a future upstream merge does not
+# have to be untangled -- but take their values from hand_config, because our G1 answers
+# on rt/dex3/* rather than the PR's rt/dex5/*. Change the wiring there, not here.
+Dex5_Num_Joints = hand_config.NUM_JOINTS_EXPECTED
+Dex5_Thumb_Base_Index = hand_config.THUMB_BASE_INDEX
 # Recommended gains from the Dex5-1 DDS doc. The thumb motors report in N*m and the four
 # fingers in mNm, hence the different scale.
-Dex5_Finger_Kp, Dex5_Finger_Kd = 0.10, 0.001
-Dex5_Thumb_Kp, Dex5_Thumb_Kd = 1.0, 0.02
-kTopicDex5LeftCommand = "rt/dex5/left/cmd"
-kTopicDex5RightCommand = "rt/dex5/right/cmd"
-kTopicDex5LeftState = "rt/dex5/left/state"
-kTopicDex5RightState = "rt/dex5/right/state"
+Dex5_Finger_Kp, Dex5_Finger_Kd = hand_config.GAINS["finger"]
+Dex5_Thumb_Kp, Dex5_Thumb_Kd = hand_config.GAINS["thumb"]
+kTopicDex5LeftCommand = hand_config.TOPIC_LEFT_CMD
+kTopicDex5RightCommand = hand_config.TOPIC_RIGHT_CMD
+kTopicDex5LeftState = hand_config.TOPIC_LEFT_STATE
+kTopicDex5RightState = hand_config.TOPIC_RIGHT_STATE
 
 class Dex5_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
@@ -84,16 +89,49 @@ class Dex5_1_Controller:
         self.left_hand_state_array  = Array('d', Dex5_Num_Joints, lock=True)
         self.right_hand_state_array = Array('d', Dex5_Num_Joints, lock=True)
 
+        # [panthera] fail-closed bookkeeping, written by the subscribe thread and read here.
+        self._subscribe_error = None          # exception raised inside the thread, re-raised below
+        self._state_seen = {}                 # side -> True once a VALID first state arrived
+        self._hand_counts = {}                # side -> (n_motor, n_press), hardware evidence H1
+
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
+        logger_mp.info(hand_config.describe())
+
+        # [panthera] Bounded wait. Upstream loops forever on `any(state_array)`, which has two
+        # problems: a hand that never streams hangs the launcher with no diagnosis, and a hand
+        # legitimately resting at q=0.0 on every joint never satisfies `any()`. Wait instead for
+        # a valid first message on each side, on a monotonic deadline (never wall clock, which
+        # can step under NTP mid-session).
+        deadline = time.monotonic() + hand_config.STATE_TIMEOUT_S
+        last_warning = 0.0
         while True:
-            if any(self.left_hand_state_array) and any(self.right_hand_state_array):
+            if self._subscribe_error is not None:
+                # A dead subscribe thread must not look like "still waiting to subscribe".
+                raise self._subscribe_error
+            if self._state_seen.get("left") and self._state_seen.get("right"):
                 break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"[Dex5_1_Controller] no HandState_ on {kTopicDex5LeftState} / "
+                    f"{kTopicDex5RightState} within {hand_config.STATE_TIMEOUT_S}s "
+                    f"(saw: {sorted(self._state_seen) or 'nothing'}). "
+                    "Note that DDS discovery is per network interface -- the launcher's "
+                    "--network-interface must be the one the hands are on. Three usual causes: "
+                    "(1) the hands are unpowered or have not enumerated on the bus; "
+                    "(2) wrong DDS domain or interface; "
+                    f"(3) wrong topic prefix -- DEX5_TOPIC_PREFIX is currently "
+                    f"'{hand_config.TOPIC_PREFIX}', try the other of rt/dex3 or rt/dex5.")
             time.sleep(0.01)
-            logger_mp.warning("[Dex5_1_Controller] Waiting to subscribe dds...")
+            # [panthera] Throttled to 1 Hz. Upstream warns every 10 ms, which buries the
+            # RuntimeError above under ~1000 identical lines by the time the deadline hits.
+            if time.monotonic() - last_warning >= 1.0:
+                last_warning = time.monotonic()
+                logger_mp.warning("[Dex5_1_Controller] Waiting to subscribe dds... "
+                                  f"({deadline - time.monotonic():.0f}s left)")
         logger_mp.info("[Dex5_1_Controller] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
@@ -103,15 +141,41 @@ class Dex5_1_Controller:
 
         logger_mp.info("Initialize Dex5_1_Controller OK!")
 
+    def _check_first_state(self, side, msg):
+        """[panthera] Record and validate the counts on the first state of one side.
+
+        len(motor_state) is the only thing on the wire that distinguishes a Dex5-1P
+        (20) from a Dex3-1 (7), and both answer on the same topic on our firmware.
+        Refusing here is what stops a 20-joint command stream reaching a 7-motor hand.
+        """
+        n_motor, n_press = hand_config.read_hand_counts(msg)
+        self._hand_counts[side] = (n_motor, n_press)
+        logger_mp.info(f"[Dex5_1_Controller] {side} hand first state: "
+                       f"motor_state={n_motor} press_sensor_state={n_press}")
+        if n_motor != Dex5_Num_Joints:
+            raise RuntimeError(
+                f"{side}: motor_state has {n_motor} entries; "
+                f"7 = Dex3-1 fitted, expected {Dex5_Num_Joints} (Dex5-1P)")
+        self._state_seen[side] = True
+
     def _subscribe_hand_state(self):
-        while True:
-            left_hand_msg  = self.LeftHandState_subscriber.Read()
-            right_hand_msg = self.RightHandState_subscriber.Read()
-            if left_hand_msg is not None and right_hand_msg is not None:
-                for idx in range(Dex5_Num_Joints):
-                    self.left_hand_state_array[idx]  = left_hand_msg.motor_state[idx].q
-                    self.right_hand_state_array[idx] = right_hand_msg.motor_state[idx].q
-            time.sleep(0.002)
+        # [panthera] Everything is wrapped: an exception in a daemon thread is otherwise
+        # invisible, and the caller would spin in the wait loop until its deadline with a
+        # misleading "Waiting to subscribe dds..." instead of the real error.
+        try:
+            while True:
+                left_hand_msg  = self.LeftHandState_subscriber.Read()
+                right_hand_msg = self.RightHandState_subscriber.Read()
+                for side, msg in (("left", left_hand_msg), ("right", right_hand_msg)):
+                    if msg is not None and side not in self._hand_counts:
+                        self._check_first_state(side, msg)
+                if left_hand_msg is not None and right_hand_msg is not None:
+                    for idx in range(Dex5_Num_Joints):
+                        self.left_hand_state_array[idx]  = left_hand_msg.motor_state[idx].q
+                        self.right_hand_state_array[idx] = right_hand_msg.motor_state[idx].q
+                time.sleep(0.002)
+        except BaseException as exc:          # noqa: BLE001 -- re-raised by the wait loop
+            self._subscribe_error = exc
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """set current left, right hand joint target q"""
@@ -132,18 +196,10 @@ class Dex5_1_Controller:
 
         # initialize dex5-1's cmd msgs. The default factory sizes motor_cmd for dex3's 7
         # motors, so the sequence has to be rebuilt at the dex5 joint count.
-        self.left_msg  = unitree_hg_msg_dds__HandCmd_()
-        self.right_msg = unitree_hg_msg_dds__HandCmd_()
-        for msg in (self.left_msg, self.right_msg):
-            msg.motor_cmd = [unitree_hg_msg_dds__MotorCmd_() for _ in range(Dex5_Num_Joints)]
-            for idx in range(Dex5_Num_Joints):
-                is_thumb = idx >= Dex5_Thumb_Base_Index
-                msg.motor_cmd[idx].mode = 0x01  # position control
-                msg.motor_cmd[idx].q    = 0.0
-                msg.motor_cmd[idx].dq   = 0.0
-                msg.motor_cmd[idx].tau  = 0.0
-                msg.motor_cmd[idx].kp   = Dex5_Thumb_Kp if is_thumb else Dex5_Finger_Kp
-                msg.motor_cmd[idx].kd   = Dex5_Thumb_Kd if is_thumb else Dex5_Finger_Kd
+        # [panthera] Behaviour is identical to the PR's inline rebuild; it lives in
+        # hand_config so the operator tools construct byte-identical commands.
+        self.left_msg  = hand_config.make_hand_cmd(Dex5_Num_Joints)
+        self.right_msg = hand_config.make_hand_cmd(Dex5_Num_Joints)
 
         try:
             while self.running:
