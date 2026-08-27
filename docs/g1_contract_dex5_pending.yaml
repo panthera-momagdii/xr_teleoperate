@@ -1,0 +1,99 @@
+# Panthera G1 + Dex5-1P hardware contract -- PENDING fields.
+#
+# Every value here is unknown until the hands actually stream. On 2026-08-24 a
+# read-only probe from PC2 saw the hand topics DECLARED on the bus but received
+# zero samples in 600 s, so nothing below could be measured. Fill each field from
+# the named tool's output on robot day, then fold it into g1_contract.yaml.
+#
+# status: pending | measured | assumed
+# Do not delete a field once measured -- change its status and record how.
+
+hand_topic_prefix:
+  status: pending
+  value: null
+  current_default: "rt/dex3"          # hand_config.TOPIC_PREFIX, overridable by DEX5_TOPIC_PREFIX
+  why_this_default: >
+    Our G1's firmware answered on rt/dex3/{left,right}/{cmd,state} on 2026-08-24
+    (participant g1_dex_protocol_v2.0); rt/dex5/* did not exist. PR #321 hardcodes
+    rt/dex5/*, which is why hand_config exists at all. "dex3" is a generic namespace
+    on this firmware, not a statement about which hand is fitted.
+  how_to_measure: >
+    With the hands powered, list topics on the robot's domain. If rt/dex5/* appears,
+    set DEX5_TOPIC_PREFIX=rt/dex5 and re-run tools/hand_probe.py.
+  where_it_goes: teleop/robot_control/hand_config.py TOPIC_PREFIX
+
+hand_motor_count:
+  status: pending
+  value: null
+  expected: 20                        # Dex5-1P; a Dex3-1 reports 7
+  note: >
+    PR #321 comments that 20 DDS joint indices drive 16 physical motors, the firmware
+    doing the joint->motor transform. So 20 is the expected len(motor_state) even
+    though the hand has 16 actuators.
+  how_to_measure: "tools/hand_probe.py --domain 0 --iface <nic> --seconds 60 -> sides.<side>.n_motor"
+  where_it_goes: teleop/robot_control/hand_config.py NUM_JOINTS_EXPECTED
+  fail_closed: >
+    Dex5_1_Controller raises if len(motor_state) != NUM_JOINTS_EXPECTED, naming both
+    values. Verified offline: a 7-motor stream is refused in 0.46 s.
+
+press_sensor_modules:
+  status: pending
+  value: null
+  expected: 12
+  slots_per_module: 12                # PressSensorState_.pressure is float32[12]
+  how_to_measure: >
+    tools/hand_probe.py -> sides.<side>.n_press, and press_modules[i].nonzero_slots
+    for the tactile index map (which of the 12*n_press slots actually report).
+  where_it_goes: g1_contract.yaml, and the tactile block of the recorder schema
+
+passive_slot_behaviour:
+  status: pending
+  value: null
+  question: >
+    Are DDS slots 3, 7, 11, 15 (the distal joints of index/middle/ring/pinky) driven,
+    or mechanically coupled to slots 2, 6, 10, 14?
+  how_to_measure: >
+    PANTHERA_HAND_CMD_OK=1 tools/hand_step.py --domain 0 --iface <nic> --side left
+      --joint 2 --amplitude 0.3 --hold 5
+    Read the "H2:" line. If slot 3 travels while only slot 2 is commanded, it is
+    coupled. Repeat for joints 6, 10, 14. tools/hand_probe.py also reports the
+    ratio passively over any capture.
+  consequence_if_coupled: >
+    Retargeting output for those slots is ignored by the hardware, and commanding
+    them independently may fight the linkage.
+
+verified_gains:
+  status: pending
+  finger: {kp: 0.10, kd: 0.001, status: assumed}
+  thumb:  {kp: 1.00, kd: 0.02,  status: assumed}
+  thumb_base_index: 16
+  source: >
+    PR #321 author's values, taken from the Dex5-1 DDS doc, unverified on hardware.
+    robot_hand_unitree.py:31 states the reason for the 10x difference: "the thumb
+    motors report in N*m and the four fingers in mNm, hence the different scale."
+  how_to_measure: >
+    tools/hand_step.py prints time-to-90% and overshoot for a commanded step. Run a
+    finger slot and a thumb slot at the default gains; if the two respond with wildly
+    different stiffness the unit story is wrong.
+  do_not: "Do not tune these offline. They are a hardware decision."
+
+hand_power_and_enumeration:
+  status: pending
+  value: null
+  observed_2026_08_24: "topics declared, 0 samples in 600 s"
+  how_to_measure: "tools/hand_probe.py exits 3 on silence; exit 0 means both sides streamed."
+
+state_rate_hz:
+  status: pending
+  value: null
+  expected: 100
+  how_to_measure: "tools/hand_probe.py -> sides.<side>.rate_hz"
+
+motor_temperature_idle_c:
+  status: pending
+  value: null
+  note: >
+    MotorState_.temperature is array[int16, 2] -- two sensors per motor, not a scalar.
+    hand_config.motor_temperature() returns the hotter of the two.
+  current_abort_threshold: 45.0       # hand_config.TEMP_LIMIT_C, a conservative bench guess
+  how_to_measure: "tools/hand_probe.py -> sides.<side>.motors[i].temp_min/temp_max"
