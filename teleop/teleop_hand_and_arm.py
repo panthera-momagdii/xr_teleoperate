@@ -100,6 +100,14 @@ if __name__ == '__main__':
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
 
+    # [panthera] Checked here, before the try block: ChannelFactoryInitialize and
+    # MotionSwitcher().Enter_Debug_Mode() both run inside it, and Enter_Debug_Mode
+    # releases the robot's motion control. Nothing that touches the robot may happen
+    # on the way to reporting a bad argument combination.
+    if args.ee == "dex5" and args.sim:
+        parser.error("--ee dex5 has no simulation target (unitree_sim_isaaclab ships "
+                     "Dex3 only); use --ee dex3 with --sim, or drop --sim")
+
     try:
         # setup dds communication domains id
         if args.sim:
@@ -184,6 +192,19 @@ if __name__ == '__main__':
         elif args.arm == "R1_A7":
             arm_ik = R1_A7_ArmIK()
             arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+
+        # [panthera] One place for every --arm branch. Upstream fixes the limit at 30.0 rad/s
+        # in the constructor with no way to lower it; hardware sessions run XR_ARM_VEL_LIMIT=5
+        # until we trust the mapping. Default is unchanged, so behaviour without the env var
+        # is exactly upstream's.
+        arm_velocity_limit = float(os.environ.get("XR_ARM_VEL_LIMIT", "30.0"))
+        if hasattr(arm_ctrl, "set_arm_velocity_limit"):
+            arm_ctrl.set_arm_velocity_limit(arm_velocity_limit)
+            logger_mp.info(f"[arm] velocity limit set to {arm_velocity_limit} rad/s "
+                           f"(XR_ARM_VEL_LIMIT, default 30.0)")
+        else:
+            logger_mp.warning(f"[arm] {type(arm_ctrl).__name__} has no set_arm_velocity_limit; "
+                              f"XR_ARM_VEL_LIMIT={arm_velocity_limit} NOT applied")
 
         # end-effector
         if args.ee in ("dex3", "dex5", "inspire_ftp", "inspire_dfx") and args.input_mode == "controller":
