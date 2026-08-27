@@ -1,0 +1,314 @@
+# Panthera G1 hardware contract -- measured on PC2, 2026-08-28 (Part A, read-only).
+#
+# PREMISE CHANGE, 2026-08-28: the hands on this robot are NOT Dex5-1P.
+# The shell reads INSPIRE-ROBOTS and the wrist ring reads RH56... -- Inspire RH56 hands.
+# They do not speak Unitree's dex3 DDS protocol at all; they are driven from PC2 over
+# Modbus TCP. That closes the 2026-08-24 "hands are silent" investigation as
+# WRONG HAND MODEL, not as a fault. No Unitree ticket.
+#
+# Consequence: every DDS-hand field below is VOID -- not pending. They were questions
+# about a part that is not fitted. They are kept, not deleted, per this file's own rule
+# ("Do not delete a field once measured"), each with status: void and the reason.
+#
+# status: pending | measured | assumed | void
+# Filename kept as-is so the diff is reviewable; it should be renamed once merged.
+
+# =====================================================================
+# THE HANDS -- as actually fitted
+# =====================================================================
+hand_model:
+  status: measured
+  value: "Inspire RH56"
+  variant:
+    status: measured
+    value: "RH56E2-T1"
+    measured_on: "2026-08-27, labels read directly at the wrist ring"
+    labels:
+      right: "RH56E2-2R-T1"
+      left:  "RH56E2-2L-T1"
+    vendor_marking: "www.inspire-robots.com"
+    supersedes: >
+      This block previously read status: pending with candidates
+      ["RH56F-TP (Modbus TCP / Ethernet)", "RH56DFX / RH56DFQ (RS-485 / USB serial)"]
+      and evidence_points_to: "RH56F-TP". The label reading resolves it and shows the
+      guess was wrong in NAME: the part is an E2, which was not among the candidates.
+      The Ethernet inference was right (E2 is Inspire's Ethernet generation, and the
+      absent serial path independently rules out DFX/DFQ) -- but do not carry the
+      "RH56F-TP" name forward anywhere. Whether E2 shares the FTP register map and
+      bridge is the open question, tracked in docs/inspire_rh56e2.md.
+  serial_numbers:
+    right:
+      status: measured
+      value: "411AA1A04140021"
+    left:
+      status: measured_partial
+      value: "401AA1A0416??01"
+      confidence: >
+        Read from Brandon's photo of the left wrist ring. Two characters (positions 12-13,
+        shown as ??) are not legible in the image; they are most likely "01". Treat the
+        full string as UNCONFIRMED until someone reads the ring directly -- it is an
+        identity field, and a serial that is 90% right is not a serial.
+      note: >
+        The left prefix reads 401..., the right 411... -- they differ in the third
+        character. That is expected to be a per-unit serial, not a typo, but it is
+        another reason not to infer the missing characters from the right hand's SN.
+  power_led:
+    status: measured
+    value: "green on both hands"
+  tactile:
+    status: pending
+    value: null
+    hypothesis: "the T1 suffix is most likely Inspire's tactile option"
+    blocked_on: >
+      Confirm against Inspire's own RH56E2 material -- VERIFY, DO NOT ASSUME. Even if
+      T1 is tactile, whether that data reaches the DDS state message is a separate
+      question about the bridge, not about the hand.
+  actuators_per_hand:
+    status: measured
+    value: 6
+    source: "Inspire RH56 family specification"
+  joints_per_hand:
+    status: measured
+    value: 12
+    note: "12 joints driven by 6 actuators -- the extra DoF are mechanically coupled, not independently commandable."
+
+hand_transport:
+  status: measured
+  value: "Modbus TCP over Ethernet, from PC2"
+  hosts:
+    left_or_right_unassigned: ["192.168.123.210", "192.168.123.211"]
+    note: >
+      Which address is which hand is UNKNOWN and stays unknown until it is read, not
+      guessed. Do not infer it from .210 < .211 or from the MAC ordering.
+    how_to_resolve_without_moving_anything: >
+      Read state from one address and compare it with the physical hand -- e.g. a finger
+      held closed by hand shows in that address's angle registers. Reading is a session
+      on the hand but moves nothing. Assigning left/right wrongly and then commanding is
+      how a hand gets driven into the wrong limits.
+  evidence:
+    ping_210: "2/2 received, rtt avg 0.350 ms, dev eth0"
+    ping_211: "2/2 received, rtt avg 0.248 ms, dev eth0"
+    mac_210: "de:08:c0:a8:7b:d2"
+    mac_211: "de:08:c0:a8:7b:d3"
+    mac_note: >
+      c0:a8:7b:d2 is 192.168.123.210 written in hex, and the de: prefix is
+      locally administered -- an embedded Ethernet module deriving its MAC from its
+      configured IP. There is therefore NO vendor OUI to identify these by.
+  serial_path_absent:
+    status: measured
+    value: "none"
+    evidence: >
+      No /dev/ttyUSB*, no /dev/ttyACM*, /dev/serial/by-id does not exist, no FTDI /
+      CP210x / CH340 / Prolific bridge in lsusb, no usbserial kernel modules loaded.
+      Only the Tegra SoC's own UARTs (ttyTHS0/3/4) with nothing attached.
+      This is what rules out the RS-485/USB DFX/DFQ variants.
+
+hand_driver_software_on_pc2:
+  status: measured
+  value: "NONE INSTALLED"
+  detail:
+    pymodbus: "not installed (neither system python3.8 nor conda g1visit py3.10)"
+    pyserial: "not installed"
+    mbpoll_modpoll: "not installed"
+    unitree_inspire_dds: "not present -- find / -iname '*inspire*' returns nothing"
+    container_image: "none -- no image, and none of 30+ containers reference inspire/modbus/rh56/hand"
+    rt_inspire_topics: "0 on PC1's topic list, and 0 anywhere in the SEDP trace from any host"
+  consequence: >
+    The hands are reachable on the network and nothing on this box can talk to them.
+    This is the gap to close before Part B can include hands. It is a bounded software
+    gap, not a hardware fault.
+  not_done_deliberately: >
+    No TCP connect to port 502, no Modbus register read, no service started --
+    a register read is a session on the hand.
+
+# =====================================================================
+# VOID -- questions about a Dex5-1P that is not fitted
+# =====================================================================
+hand_topic_prefix:
+  status: void
+  observed_value: "rt/dex3"
+  reason: >
+    rt/dex3/{left,right}/state and rt/lf/dex3/{left,right}/state ARE declared by PC1
+    participant g1_dex_protocol_v2.0, and all four produced 0 samples
+    (30 s on rt/dex3/*, 20 s on rt/lf/dex3/* -- the lf pair probed for the first time
+    on 2026-08-28). They are the stock dex3 service advertising for a Unitree hand that
+    is not attached. Nothing will ever publish there with Inspire hands fitted.
+  negative_result: >
+    grep -icE 'dex5|dex1/|hand_sdk|inspire|brainco' over all 89 topics published by PC1
+    returns 0. This firmware exposes the hands under no other name -- the silence was
+    not a namespace mistake.
+
+hand_motor_count:
+  status: void
+  reason: "No DDS hand stream exists. Superseded by hand_model.actuators_per_hand (6) and joints_per_hand (12)."
+  previously_expected: 20
+
+press_sensor_modules:
+  status: void
+  reason: "Dex5 PressSensorState_ does not apply. Superseded by hand_model.tactile (pending variant)."
+  previously_expected: 12
+
+passive_slot_behaviour:
+  status: void
+  reason: >
+    The DDS slot 4k+3 / 4k+2 coupling question was about Dex5 joint indices.
+    RH56 coupling is a different mechanism (12 joints from 6 actuators) and must be
+    re-asked against the Modbus register map once a driver exists.
+
+verified_gains:
+  status: void
+  reason: "Dex5 DDS kp/kd in N*m vs mNm. RH56 is commanded over Modbus registers; the unit story does not carry over."
+
+hand_power_and_enumeration:
+  status: void
+  observed_2026_08_24: "topics declared, 0 samples in 600 s"
+  observed_2026_08_28: "topics declared, 0 samples in 30 s (rt/dex3) and 20 s (rt/lf/dex3)"
+  reason: "Explained: wrong hand model. The dex3 service has no hand to talk to."
+
+state_rate_hz:
+  status: void
+  reason: "No DDS hand stream. An RH56 poll rate will be a Modbus polling decision, not a published topic rate."
+
+motor_temperature_idle_c:
+  status: void
+  reason: "Dex5 MotorState_.temperature does not apply. RH56 exposes temperature over Modbus registers if at all."
+
+# =====================================================================
+# DOMAIN 0 -- measured 2026-08-28, our containers all stopped
+# =====================================================================
+domain0:
+  participants_total:
+    status: measured
+    value: 25
+    besides_our_tool: 24
+  process_names:
+    status: measured
+    value: [LogStreamService, ai_odom_node, basic_service, battery_guard, dds_bridge,
+            emergency_stop, g1_dex_protocol_v2.0, humanoid, motion_switcher_service,
+            python, python3, robot_state_service, robot_type_api_server,
+            unitreeWebRTCClientMaster, videohub_pc4, vui_service, xfkTon]
+  writers_by_host:
+    status: measured
+    value: {"192.168.123.161": 89, "192.168.123.164": 2}
+    note: >
+      Both PC2 writers are the STOCK videohub_pc4 service (rt/api/videohub/response,
+      rt/frontvideostream). Neither is a command topic. Zero command-topic writers
+      from any host but PC1.
+
+  RATE_CAVEAT: >
+    Every Hz below is a FLOOR, not a measurement. tools/domain0_census.py derives rate
+    from its own dequeued sample count, so a reader that cannot keep up under-reports
+    with no signal. Two tells: rt/lowcmd (666.5) and rt/lowstate (660.4) land within 1%
+    of each other despite being independent streams from different PC1 processes -- the
+    signature of a consumer-side ceiling -- and the 2026-08-24 tick-derived figure for
+    rt/lowstate was 999.6 Hz, ~1.5x higher. Measured with our containers down
+    (load 1.57, GPU 0), so it is not our own contention.
+    Fix tracked in logs/g14_census_bugs.md item (c).
+
+  lowstate:
+    status: measured
+    writers: 2
+    per_writer_hz: {"...4b5fbae8:203": 660.4, "...6f5f3a66:203": 0.0}
+    aggregate_hz_floor: 660.4
+    tick_derived_hz_2026_08_24: 999.6
+    type: "unitree_hg::msg::dds_::LowState_"
+  lowcmd:
+    status: measured
+    writers: 2
+    per_writer_hz: {"...fc552420:1403": 666.5, "...33011e6c:e03": 0.0}
+    split_note: >
+      H3 answered: this is NOT a ~500/133 split. ONE writer carries the entire stream
+      and the other is idle at 0.0 Hz. Same shape on rt/lowstate.
+    source_verified: "both udp/192.168.123.161 (PC1), from the SEDP trace"
+    type: "unitree_hg::msg::dds_::LowCmd_"
+  arm_sdk:
+    status: measured
+    writers: 1
+    hz: 0.0
+    note: "Declared-but-idle endpoint from PC1, present 2026-08-24 and again today. Not motion mode."
+  type_agreement:
+    status: measured
+    value: "all writers agree on every watched topic; all unitree_hg"
+
+# =====================================================================
+# CAMERA -- measured 2026-08-28
+# =====================================================================
+camera:
+  count:
+    status: measured
+    value: 1
+    note: "Head only. Exactly one Intel device on USB; no wrist cameras exist."
+  model:
+    status: measured
+    value: "Intel RealSense D435i"
+  serial_librealsense:
+    status: measured
+    value: "254522071775"
+    caveat: "Only visible via pyrealsense2, which does NOT work on this box -- see driver_path."
+  serial_usb_descriptor:
+    status: measured
+    value: "255323062039"
+    caveat: "Different number, same camera. This is what the UVC/OpenCV path sees and would match on."
+  driver_path:
+    status: measured
+    value: "opencv (UVC fallback)"
+    reason: >
+      pyrealsense2 2.58.3 installs but will not import: it needs GLIBC_2.32 and this box
+      is Ubuntu 20.04 with glibc 2.31. The --rs path is therefore unavailable.
+  colour_node:
+    status: measured
+    value: "/dev/video5"
+    physical_path: "/sys/devices/platform/3610000.xhci/usb2/2-2/2-2.3/2-2.3:1.3"
+    how_determined: >
+      /dev/video2 (iface :1.0) fourcc=UYVY, meanBGR=(151.3,151.3,151.3) -> IR/grey.
+      /dev/video5 (iface :1.3) fourcc=YUYV, meanBGR=(26.4,32.7,8.5)     -> colour.
+    config_note: "Pinned by physical_path (highest resolver priority), serial_number null."
+  resolution_fps:
+    status: measured
+    value: "640x480 @ 30"
+  measured_fps:
+    status: measured
+    client_side: 29.1
+    server_reported: 29.9
+    method: "291 unique frames in 10.0 s via teleimager ImageClient on 127.0.0.1, request_bgr=True"
+  transport:
+    status: measured
+    zmq: "enabled, port 55555"
+    webrtc: "disabled -- the headset cannot reach 192.168.123.x; ZMQ to the laptop carries the picture"
+
+# =====================================================================
+# PC2 HEADROOM (H4) -- measured 2026-08-28
+# =====================================================================
+pc2:
+  host: {status: measured, value: "Jetson Orin NX, Ubuntu 20.04.6, L4T R35.3.1, aarch64, 8 cores, 15 GiB RAM"}
+  load_with_our_containers_up:   {status: measured, value: 4.26, at: "01:23"}
+  load_with_our_containers_down: {status: measured, value: 0.54, at: "02:17"}
+  load_with_image_server_only:   {status: measured, value: 0.24, at: "02:27"}
+  gpu_load_containers_down:      {status: measured, value: 0, unit: "per-mille, sustained over 10 s"}
+  thermals_containers_down:      {status: measured, value: "tj 54.8 C, CPU 53.2 C, GPU 52.4 C"}
+  image_server_cost:             {status: measured, value: "~38% of one core, GPU 0, thermals flat"}
+  gpu_hog:
+    status: measured
+    value: "ferox_vision -> perception_node (TensorRT)"
+    correction: >
+      The Aug-24 note "none of ours running -- a stock service" is not what the box shows.
+      Stopping OUR four containers took load 4.26 -> 1.57 -> 0.54 and GPU to 0. The burn
+      was ours: perception_node on the GPU, imu_republisher/odom_tf_bridge
+      (panthera_g1_driver) and realsense2_camera on CPU.
+  only_stock_cpu_consumer:
+    status: measured
+    value: "videohub_pc4 at 1.4%, under master_service.service (LSB init script)"
+    action: "identified only -- not stopped, not disabled"
+
+# =====================================================================
+# TOOLCHAIN
+# =====================================================================
+toolchain:
+  python:        {status: measured, value: "conda env g1visit, Python 3.10.21, conda-forge only"}
+  cyclonedds:    {status: measured, value: "0.10.2, built against CYCLONEDDS_HOME=/home/unitree/cyclonedds_ws/install/cyclonedds"}
+  unitree_sdk2py: {status: measured, value: "65691c8 (merge-base 404fe44 -> sdk-ok)"}
+  xrt_branch:    {status: measured, value: "panthera/dex5-1p, 13 commits on 845b25a"}
+  teleimager:    {status: measured, value: "57cf2a4, installed with [server] extras; pyrealsense2 unusable (GLIBC)"}
+  conda_note: >
+    Anaconda default channels demand a Terms-of-Service acceptance -- a licensing
+    decision. The env was built from conda-forge with --override-channels instead.
