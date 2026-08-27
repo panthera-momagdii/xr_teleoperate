@@ -74,6 +74,9 @@ class Dex5_1_Controller:
         else:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX5_Unit_Test)
 
+        # [panthera] Per-joint travel limits, in HARDWARE order, shrunk by the margin.
+        self.q_lower, self.q_upper = self._build_joint_limits()
+
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex5LeftCommand, HandCmd_)
         self.LeftHandCmb_publisher.Init()
@@ -135,6 +138,56 @@ class Dex5_1_Controller:
 
         logger_mp.info("Initialize Dex5_1_Controller OK!")
 
+    def _build_joint_limits(self):
+        """[panthera] Per-joint (lower, upper) in hardware order, shrunk by the margin.
+
+        Source: the retargeting object itself -- SeqRetargeting.joint_limits, which
+        dex_retargeting built from assets/unitree_hand_Dex5/Dex5-URDF-{L,R}.urdf. Using
+        the same object that produces the targets means the clamp can never disagree
+        with the optimiser about what the hand can do; loading the URDFs a second time
+        here would be a second source that could drift. Verified equal to a direct
+        Pinocchio read of those URDFs (tools/test_dex5_clamp_slew.py).
+
+        joint_limits is indexed in retargeting joint order, so it takes the same
+        *_dex_retargeting_to_hardware permutation that retarget()'s output takes.
+        """
+        margin = hand_config.DEX5_LIMIT_MARGIN_RAD
+        lower, upper = {}, {}
+        for side in ("left", "right"):
+            retargeting = getattr(self.hand_retargeting, f"{side}_retargeting")
+            perm = getattr(self.hand_retargeting, f"{side}_dex_retargeting_to_hardware")
+            limits = np.asarray(retargeting.joint_limits, dtype=float)[perm]
+            lower[side] = limits[:, 0] + margin
+            upper[side] = limits[:, 1] - margin
+            # A margin wider than the joint's travel would invert the bounds.
+            bad = lower[side] > upper[side]
+            if np.any(bad):
+                raise RuntimeError(
+                    f"DEX5_LIMIT_MARGIN_RAD={margin} exceeds the travel of "
+                    f"{side} joints {list(np.flatnonzero(bad))}")
+
+        logger_mp.info(
+            f"[Dex5_1_Controller] travel limits (hardware order, URDF limits shrunk by "
+            f"{margin} rad), max step {hand_config.DEX5_MAX_STEP_RAD} rad/cycle "
+            f"= {hand_config.DEX5_MAX_STEP_RAD * self.fps:g} rad/s at {self.fps:g} Hz:\n"
+            + "\n".join(
+                f"    [{i:2d}] {hand_config.group_of(i):6s} "
+                f"L [{lower['left'][i]:+.4f}, {upper['left'][i]:+.4f}]   "
+                f"R [{lower['right'][i]:+.4f}, {upper['right'][i]:+.4f}]"
+                for i in range(Dex5_Num_Joints)))
+        return lower, upper
+
+    def _limit_command(self, target, last_cmd, side):
+        """[panthera] Slew-limit toward the target, then clamp to travel limits.
+
+        Order matters: the slew is measured against the previous COMMAND, so clamping
+        afterwards cannot produce a step larger than DEX5_MAX_STEP_RAD -- clamping only
+        ever moves the value back toward the interior, i.e. toward last_cmd.
+        """
+        step = hand_config.DEX5_MAX_STEP_RAD
+        cmd = np.clip(target, last_cmd - step, last_cmd + step)
+        return np.clip(cmd, self.q_lower[side], self.q_upper[side])
+
     def _check_first_state(self, side, msg):
         """[panthera] Record and validate the counts on the first state of one side.
 
@@ -193,6 +246,28 @@ class Dex5_1_Controller:
         self.left_msg  = hand_config.make_hand_cmd(Dex5_Num_Joints)
         self.right_msg = hand_config.make_hand_cmd(Dex5_Num_Joints)
 
+        # [panthera] Slew starts from where the hand ACTUALLY IS, not from zero. __init__
+        # has already waited for a valid first state on both sides, so these arrays are
+        # populated. Starting from zero would make the very first command a full-travel
+        # snap to the open pose -- exactly the jump this limiter exists to prevent, and
+        # what the unmodified PR does on every start.
+        left_last_cmd  = np.array(left_hand_state_array[:], dtype=float)
+        right_last_cmd = np.array(right_hand_state_array[:], dtype=float)
+        for side, measured in (("left", left_last_cmd), ("right", right_last_cmd)):
+            outside = np.flatnonzero(
+                (measured < self.q_lower[side] - hand_config.DEX5_LIMIT_MARGIN_RAD)
+                | (measured > self.q_upper[side] + hand_config.DEX5_LIMIT_MARGIN_RAD))
+            if outside.size:
+                logger_mp.warning(
+                    f"[Dex5_1_Controller] {side} hand starts outside its travel limits at "
+                    f"slots {list(outside)} (q={[round(measured[i], 4) for i in outside]}); "
+                    f"the first command clamps them back inside.")
+        left_last_cmd  = np.clip(left_last_cmd,  self.q_lower["left"],  self.q_upper["left"])
+        right_last_cmd = np.clip(right_last_cmd, self.q_lower["right"], self.q_upper["right"])
+        logger_mp.info(f"[Dex5_1_Controller] slew starts from the measured state: "
+                       f"left[0:4]={np.round(left_last_cmd[:4], 4).tolist()}, "
+                       f"right[0:4]={np.round(right_last_cmd[:4], 4).tolist()}")
+
         try:
             while self.running:
                 start_time = time.time()
@@ -220,14 +295,26 @@ class Dex5_1_Controller:
                     left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.left_dex_retargeting_to_hardware]
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
+                # [panthera] Rate- and range-limit before anything sees the value.
+                # Applied unconditionally, including while xr_motion_data_ready is false:
+                # in that state the PR holds left/right_q_target at their initial zeros,
+                # so an unlimited controller snaps the hand to fully open on the first
+                # cycle. The target semantics are unchanged; only the command is limited.
+                left_cmd  = self._limit_command(left_q_target,  left_last_cmd,  "left")
+                right_cmd = self._limit_command(right_q_target, right_last_cmd, "right")
+                left_last_cmd, right_last_cmd = left_cmd, right_cmd
+
                 # get dual hand action
-                action_data = np.concatenate((left_q_target, right_q_target))    
+                # [panthera] The recorder logs what was SENT, not the raw retargeted
+                # target. An episode whose `action` never happened is worse than no
+                # episode: anything trained on it learns a hand that can teleport.
+                action_data = np.concatenate((left_cmd, right_cmd))
                 if dual_hand_state_array_out and dual_hand_action_array_out:
                     with dual_hand_data_lock:
                         dual_hand_state_array_out[:] = state_data
                         dual_hand_action_array_out[:] = action_data
 
-                self.ctrl_dual_hand(left_q_target, right_q_target)
+                self.ctrl_dual_hand(left_cmd, right_cmd)
                 current_time = time.time()
                 time_elapsed = current_time - start_time
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)

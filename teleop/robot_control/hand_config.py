@@ -76,6 +76,29 @@ GAINS = {
 THUMB_BASE_INDEX = 16
 
 
+# --- rate and range limiting -----------------------------------------------
+# DexPilot already keeps its output inside the URDF limits (plus its own 1e-3 rad
+# bound relaxation), so RANGE is not the hazard. RATE is: when the headset loses the
+# hands -- out of view, or during a power grasp -- the landmarks jump, and the
+# retargeted target moves the whole way in one 10 ms control cycle. On hardware that
+# is a finger snapping shut into an object or into the thumb.
+#
+# Per cycle, per joint the controller applies:
+#     cmd = clip(target, last_cmd - MAX_STEP, last_cmd + MAX_STEP)
+#     cmd = clip(cmd,    lower + MARGIN,      upper - MARGIN)
+#
+# 0.05 rad/cycle at the controller's 100 Hz is 5 rad/s, so a full 1.5708 rad finger
+# flexion takes 32 cycles (~0.32 s) -- fast enough to feel direct, slow enough that a
+# bad frame cannot become an impact. Measured open->fist: 29 cycles for the widest
+# joint (1.4112 rad), 33 cycles end-to-end through the retargeter's own filter.
+DEX5_MAX_STEP_RAD = float(os.environ.get("DEX5_MAX_STEP_RAD", "0.05"))
+
+# Shrink the URDF limits by this before clipping, so a command never sits exactly on a
+# mechanical stop. Matches the epsilon dex_retargeting relaxes its own bounds by
+# (dex_retargeting/optimizer.py:47, set_joint_limit(..., epsilon=1e-3)).
+DEX5_LIMIT_MARGIN_RAD = float(os.environ.get("DEX5_LIMIT_MARGIN_RAD", "0.001"))
+
+
 def group_of(idx, thumb_base_index=THUMB_BASE_INDEX):
     """Return "thumb" or "finger" for a DDS motor slot."""
     return "thumb" if idx >= thumb_base_index else "finger"
@@ -269,5 +292,8 @@ def describe():
         f"  state timeout    : {STATE_TIMEOUT_S} s   (env DEX5_STATE_TIMEOUT_S)\n"
         f"  temp limit       : {TEMP_LIMIT_C} C\n"
         f"  gains            : finger kp/kd {GAINS['finger'][0]}/{GAINS['finger'][1]}, "
-        f"thumb kp/kd {GAINS['thumb'][0]}/{GAINS['thumb'][1]} (thumb slots >= {THUMB_BASE_INDEX})"
+        f"thumb kp/kd {GAINS['thumb'][0]}/{GAINS['thumb'][1]} (thumb slots >= {THUMB_BASE_INDEX})\n"
+        f"  max step         : {DEX5_MAX_STEP_RAD} rad/cycle   (env DEX5_MAX_STEP_RAD; "
+        f"{DEX5_MAX_STEP_RAD * 100.0:g} rad/s at 100 Hz)\n"
+        f"  limit margin     : {DEX5_LIMIT_MARGIN_RAD} rad   (env DEX5_LIMIT_MARGIN_RAD)"
     )

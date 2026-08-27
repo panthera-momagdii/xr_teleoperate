@@ -41,7 +41,7 @@ PRESS_SLOTS_PER_MODULE = 12   # PressSensorState_.pressure is float32[12]
 NONZERO_PRESSURE_SLOTS = 94   # of 12 modules * 12 slots = 144, so the probe's map is partial
 
 
-def build_state(n_motor, n_press, temp):
+def build_state(n_motor, n_press, temp, q=0.0):
     """A HandState_ with sequences resized to the requested counts."""
     msg = unitree_hg_msg_dds__HandState_()
     msg.motor_state = [unitree_hg_msg_dds__MotorState_() for _ in range(n_motor)]
@@ -49,7 +49,7 @@ def build_state(n_motor, n_press, temp):
 
     for idx, motor in enumerate(msg.motor_state):
         motor.mode = 0x01
-        motor.q = 0.0
+        motor.q = float(q)
         motor.dq = 0.0
         motor.tau_est = 0.0
         motor.temperature = [int(temp), int(temp)]
@@ -128,6 +128,9 @@ def main():
                         help="number of press_sensor_state modules to publish")
     parser.add_argument("--temp", type=float, default=25.0,
                         help="temperature to report on every motor and tactile module")
+    parser.add_argument("--q", type=float, default=0.0,
+                        help="report this q on every motor (a non-zero resting pose, so a "
+                             "controller's 'start from the measured state' can be tested)")
     parser.add_argument("--rate", type=float, default=100.0, help="publish rate in Hz")
     parser.add_argument("--seconds", type=float, default=0.0,
                         help="stop after N seconds (0 = run until interrupted)")
@@ -140,7 +143,7 @@ def main():
     log = setup_tool_logger("fake_hand_state")
     log.info("THIS IS A TEST FIXTURE. Never run it on the robot's domain.")
     log.info(f"domain={args.domain} iface={args.iface} prefix={args.prefix} "
-             f"n_motor={args.n} n_press={args.n_press} temp={args.temp} "
+             f"n_motor={args.n} n_press={args.n_press} temp={args.temp} q={args.q} "
              f"rate={args.rate}Hz echo_cmd={args.echo_cmd} lag={args.lag_ms}ms")
 
     ChannelFactoryInitialize(args.domain, args.iface)
@@ -156,7 +159,8 @@ def main():
     if echo:
         log.info(f"echoing {args.prefix}/{{left,right}}/cmd -> state q after {args.lag_ms} ms")
 
-    msgs = {side: build_state(args.n, args.n_press, args.temp) for side in ("left", "right")}
+    msgs = {side: build_state(args.n, args.n_press, args.temp, args.q)
+            for side in ("left", "right")}
 
     period = 1.0 / args.rate
     started = time.monotonic()

@@ -23,6 +23,7 @@ no DDS domain 0**. Everything below was measured on this machine unless marked *
 | g09 | Hand pre-flight **before** `Enter_Debug_Mode()`; shared refusal wording | `hand_config.py`, `robot_hand_unitree.py`, `teleop_hand_and_arm.py`, `tools/test_dex5_failclosed.py` |
 | g10 | Exit 1 on a caught exception | `teleop/teleop_hand_and_arm.py` |
 | g11 | This document's exit/state sections | `docs/` |
+| g12 | Clamp + slew limit on hand targets | `hand_config.py`, `robot_hand_unitree.py`, `tools/{fake_hand_state,test_dex5_clamp_slew}.py`, `docs/` |
 
 ### The two G1 conflict resolutions
 
@@ -177,6 +178,37 @@ XR_ARM_VEL_LIMIT=5 DEX5_TOPIC_PREFIX=rt/dex3 python teleop_hand_and_arm.py \
     --img-server-ip 192.168.123.164
 ```
 
+Environment variables the hand path reads:
+
+| variable | default | what it does |
+|---|---|---|
+| `DEX5_TOPIC_PREFIX` | `rt/dex3` | hand DDS topic prefix; try `rt/dex5` if the topics move |
+| `DEX5_MAX_STEP_RAD` | `0.05` | max change per joint per control cycle. At 100 Hz that is 5 rad/s. Raise only with a reason; `10` effectively disables the limiter |
+| `DEX5_LIMIT_MARGIN_RAD` | `0.001` | URDF limits are shrunk by this before clamping, so a command never sits on a mechanical stop |
+| `DEX5_STATE_TIMEOUT_S` | `10` | how long the pre-flight and the controller wait for the first hand state |
+| `DEX5_NUM_JOINTS` | `20` | **bench only.** Overrides the fail-closed motor count. Never on the robot |
+| `XR_ARM_VEL_LIMIT` | `30.0` | arm joint velocity limit, rad/s. Hardware sessions use `5` |
+
+### What the hand actually receives, and what gets recorded
+
+The retargeted target is **not** sent straight to the hand. Every cycle, per joint:
+
+```
+cmd = clip(target,  last_cmd - DEX5_MAX_STEP_RAD, last_cmd + DEX5_MAX_STEP_RAD)
+cmd = clip(cmd,     lower + DEX5_LIMIT_MARGIN_RAD, upper - DEX5_LIMIT_MARGIN_RAD)
+```
+
+The limits are the two Dex5 URDFs' own, read from the retargeting object so the clamp and
+the optimiser cannot disagree. `last_cmd` starts from the **first measured hand state**, so
+the first command after startup ramps from where the hand actually is rather than snapping
+to the open pose — which is what the unmodified PR does on every start.
+
+**The recorder logs the command that was sent, not the raw retargeted target.**
+`actions.{left,right}_ee.qpos` is the clamped, slew-limited value. This is deliberate: an
+episode whose recorded `action` never physically happened is worse than no episode, because
+anything trained on it learns a hand that can teleport. If you need the pre-clamp target for
+analysis, it is not currently recorded — say so before a data session rather than after.
+
 Never pass `--motion`; it is not used in this project. `--ee dex5 --sim` is refused by
 design (the simulator ships a Dex3 hand only).
 
@@ -328,3 +360,6 @@ the tool that answers it and where the answer goes.
 | counting DDS readers with `take()` | destructive — a closed reader looks identical to one that was never announced, so a leak check silently reports whatever it likes | use `read()` and filter `sample_info.instance_state` (ALIVE = 16, NOT_ALIVE_DISPOSED = 32) |
 | one `cyclonedds.domain.Domain` per domain id per process | building an observer participant before `ChannelFactoryInitialize` makes the SDK fail with "create domain error" | initialise the SDK factory first |
 | `MotorState_.temperature` | `array[int16, 2]`, not a scalar | `hand_config.motor_temperature()` returns the hotter of the two |
+| a DDS writer created before a `fork` | writes from the child are invisible to a subscriber in the **parent** (measured 0 samples), but reach any other process fine (200/200). `Dex5_1_Controller` does exactly this | put test subscribers in a separate process; do not conclude the controller is mute |
+| `subprocess.Popen` from a DDS-initialised process | the exec'd child receives nothing on this build; the same command from a shell receives ~930 over the same window | start helper subscribers **before** this process calls `ChannelFactoryInitialize` |
+| comparing commanded q read back off the wire | float32: a value clamped exactly to a bound returns a few 1e-8 past it | compare with a ~1e-6 rad tolerance, not exact |
