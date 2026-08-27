@@ -115,16 +115,10 @@ class Dex5_1_Controller:
             if self._state_seen.get("left") and self._state_seen.get("right"):
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"[Dex5_1_Controller] no HandState_ on {kTopicDex5LeftState} / "
-                    f"{kTopicDex5RightState} within {hand_config.STATE_TIMEOUT_S}s "
-                    f"(saw: {sorted(self._state_seen) or 'nothing'}). "
-                    "Note that DDS discovery is per network interface -- the launcher's "
-                    "--network-interface must be the one the hands are on. Three usual causes: "
-                    "(1) the hands are unpowered or have not enumerated on the bus; "
-                    "(2) wrong DDS domain or interface; "
-                    f"(3) wrong topic prefix -- DEX5_TOPIC_PREFIX is currently "
-                    f"'{hand_config.TOPIC_PREFIX}', try the other of rt/dex3 or rt/dex5.")
+                # [panthera] Wording lives in hand_config so the launcher's pre-flight
+                # and this controller cannot drift apart. Text is unchanged.
+                raise hand_config.state_timeout_error(
+                    "[Dex5_1_Controller]", hand_config.STATE_TIMEOUT_S, self._state_seen)
             time.sleep(0.01)
             # [panthera] Throttled to 1 Hz. Upstream warns every 10 ms, which buries the
             # RuntimeError above under ~1000 identical lines by the time the deadline hits.
@@ -152,10 +146,8 @@ class Dex5_1_Controller:
         self._hand_counts[side] = (n_motor, n_press)
         logger_mp.info(f"[Dex5_1_Controller] {side} hand first state: "
                        f"motor_state={n_motor} press_sensor_state={n_press}")
-        if n_motor != Dex5_Num_Joints:
-            raise RuntimeError(
-                f"{side}: motor_state has {n_motor} entries; "
-                f"7 = Dex3-1 fitted, expected {Dex5_Num_Joints} (Dex5-1P)")
+        # [panthera] Same check the launcher's pre-flight runs, from the same source.
+        hand_config.check_motor_count(side, n_motor, Dex5_Num_Joints)
         self._state_seen[side] = True
 
     def _subscribe_hand_state(self):

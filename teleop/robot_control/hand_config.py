@@ -12,6 +12,7 @@ read-only probe.
 """
 
 import os
+import time
 
 from unitree_sdk2py.idl.default import (
     unitree_hg_msg_dds__HandCmd_,
@@ -106,6 +107,130 @@ def motor_temperature(motor_state):
     except TypeError:          # a firmware that reports a plain scalar
         return float(temps)
     return max(values) if values else None
+
+
+def motor_count_error(side, n_motor, expected=None):
+    """The single wording for a motor-count mismatch.
+
+    Used by Dex5_1_Controller and by preflight() so the two can never drift apart.
+    """
+    if expected is None:
+        expected = NUM_JOINTS_EXPECTED
+    return RuntimeError(
+        f"{side}: motor_state has {n_motor} entries; "
+        f"7 = Dex3-1 fitted, expected {expected} (Dex5-1P)")
+
+
+def check_motor_count(side, n_motor, expected=None):
+    """Raise motor_count_error unless the count matches. Fail closed."""
+    if expected is None:
+        expected = NUM_JOINTS_EXPECTED
+    if n_motor != expected:
+        raise motor_count_error(side, n_motor, expected)
+
+
+def state_timeout_error(who, timeout_s, seen):
+    """The single wording for "no hand state arrived in time".
+
+    `who` is the tag of the caller so a log line says which check gave up; the body --
+    both topics, the per-interface discovery note, the three causes -- is identical
+    wherever it is raised.
+    """
+    return RuntimeError(
+        f"{who} no HandState_ on {TOPIC_LEFT_STATE} / "
+        f"{TOPIC_RIGHT_STATE} within {timeout_s}s "
+        f"(saw: {sorted(seen) or 'nothing'}). "
+        "Note that DDS discovery is per network interface -- the launcher's "
+        "--network-interface must be the one the hands are on. Three usual causes: "
+        "(1) the hands are unpowered or have not enumerated on the bus; "
+        "(2) wrong DDS domain or interface; "
+        f"(3) wrong topic prefix -- DEX5_TOPIC_PREFIX is currently "
+        f"'{TOPIC_PREFIX}', try the other of rt/dex3 or rt/dex5.")
+
+
+def preflight(timeout_s=None, log=None):
+    """Confirm both hands are streaming a Dex5-1P-shaped state. Read-only.
+
+    Called by the launcher BEFORE MotionSwitcher().Enter_Debug_Mode(), so that a wrong
+    or missing hand stops the session while the robot still has its own controller.
+    Once debug mode is entered, refusing costs a go-home with the arms released.
+
+    Subscribes both state topics, waits for the first valid state per side on a
+    monotonic deadline, checks the motor count, and CLOSES its subscribers before
+    returning either way -- the controller creates its own readers a moment later and
+    a leaked reader would sit on the topic for the rest of the process.
+
+    ChannelFactoryInitialize must already have been called by the caller: preflight
+    does not choose a DDS domain, and this module must stay importable without one.
+
+    Returns {"left": {"n_motor": n, "n_press": n}, "right": {...}}.
+    Raises RuntimeError on timeout or on a motor-count mismatch.
+    """
+    # Imported here, not at module scope, so that `import hand_config` still touches no
+    # DDS machinery -- the read-only probe and the tools rely on that.
+    import gc
+    from unitree_sdk2py.core.channel import ChannelSubscriber
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+
+    if timeout_s is None:
+        timeout_s = STATE_TIMEOUT_S
+    if log is None:
+        log = logger_mp
+
+    counts = {}
+    seen = {}
+    error = {}
+
+    def handler(side):
+        def on_state(msg):
+            if side in counts:
+                return
+            try:
+                n_motor, n_press = read_hand_counts(msg)
+                counts[side] = {"n_motor": n_motor, "n_press": n_press}
+                log.info(f"[hand preflight] {side} hand first state: "
+                         f"motor_state={n_motor} press_sensor_state={n_press}")
+                check_motor_count(side, n_motor)
+                seen[side] = True
+            except BaseException as exc:      # surfaced by the wait loop below
+                error.setdefault("exc", exc)
+        return on_state
+
+    subs = {}
+    try:
+        for side, topic in (("left", TOPIC_LEFT_STATE), ("right", TOPIC_RIGHT_STATE)):
+            sub = ChannelSubscriber(topic, HandState_)
+            sub.Init(handler(side))
+            subs[side] = sub
+        log.info(f"[hand preflight] waiting up to {timeout_s}s for "
+                 f"{TOPIC_LEFT_STATE} and {TOPIC_RIGHT_STATE}")
+
+        deadline = time.monotonic() + timeout_s
+        last_warning = 0.0
+        while True:
+            if "exc" in error:
+                raise error["exc"]
+            if seen.get("left") and seen.get("right"):
+                break
+            if time.monotonic() >= deadline:
+                raise state_timeout_error("[hand preflight]", timeout_s, seen)
+            if time.monotonic() - last_warning >= 1.0:
+                last_warning = time.monotonic()
+                log.warning(f"[hand preflight] waiting for hand state... "
+                            f"({deadline - time.monotonic():.0f}s left)")
+            time.sleep(0.01)
+
+        log.info(f"[hand preflight] OK: left {counts['left']}, right {counts['right']}")
+        return dict(counts)
+    finally:
+        for side, sub in subs.items():
+            try:
+                sub.Close()
+            except Exception as exc:          # already closed, or never inited
+                log.warning(f"[hand preflight] closing {side} subscriber: {exc}")
+        # Channel.__Reader.Close() does `del self.__reader`; the DDS entity is released
+        # when the object is collected, so collect now rather than whenever.
+        gc.collect()
 
 
 def make_hand_cmd(n_joints=NUM_JOINTS_EXPECTED, gains=None, thumb_base_index=THUMB_BASE_INDEX):

@@ -15,6 +15,7 @@ sys.path.append(parent_dir)
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController, R1_A5_ArmController, R1_A7_ArmController
+from teleop.robot_control import hand_config
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -108,12 +109,32 @@ if __name__ == '__main__':
         parser.error("--ee dex5 has no simulation target (unitree_sim_isaaclab ships "
                      "Dex3 only); use --ee dex3 with --sim, or drop --sim")
 
+    # [panthera] Defined before the try so the finally block can distinguish "the arm
+    # controller was never built" from "it was built and we are shutting down". Without
+    # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:
+    # name 'arm_ctrl' is not defined", which reads like a second, unrelated fault.
+    arm_ctrl = None
+
     try:
         # setup dds communication domains id
         if args.sim:
             ChannelFactoryInitialize(1, networkInterface=args.network_interface)
         else:
             ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+
+        # [panthera] Hand pre-flight, deliberately the FIRST thing after DDS init.
+        #
+        # Ordering matters more than it looks. Enter_Debug_Mode() below releases the
+        # robot's own motion control; from that moment a refusal costs a go-home with
+        # the arms limp and leaves debug mode active. Dex5_1_Controller is built much
+        # later still, so its (correct) fail-closed refusal would land in `finally`.
+        # Checking here means a wrong or silent hand stops the session while the robot
+        # is still holding itself up, and before the image server is even contacted.
+        #
+        # The controller keeps its own identical check: this is defence in depth, not a
+        # replacement. preflight() closes its subscribers before returning.
+        if args.ee == "dex5":
+            hand_config.preflight(log=logger_mp)
 
         # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
@@ -570,7 +591,9 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
-            arm_ctrl.ctrl_dual_arm_go_home()
+            # [panthera] Only if it was ever built -- see the arm_ctrl = None above.
+            if arm_ctrl is not None:
+                arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
