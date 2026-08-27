@@ -114,6 +114,7 @@ if __name__ == '__main__':
     # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:
     # name 'arm_ctrl' is not defined", which reads like a second, unrelated fault.
     arm_ctrl = None
+    had_exception = False        # [panthera] see the except/finally at the bottom
 
     try:
         # setup dds communication domains id
@@ -589,6 +590,10 @@ if __name__ == '__main__':
     except Exception:
         import traceback
         logger_mp.error(traceback.format_exc())
+        # [panthera] Upstream logs the traceback and then exits 0 from `finally`, so a
+        # startup that never got off the ground is indistinguishable from a clean run
+        # for anything scripting this. Ctrl-C and the normal `q` path stay 0.
+        had_exception = True
     finally:
         try:
             # [panthera] Only if it was ever built -- see the arm_ctrl = None above.
@@ -637,4 +642,4 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
-        exit(0)
+        exit(1 if had_exception else 0)
