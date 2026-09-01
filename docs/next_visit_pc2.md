@@ -20,24 +20,90 @@ endpoint, which is this robot's normal shape.
 
 ## 1. The bridge — install on PC2, from our fork
 
-Do **not** install `NaCl-1374/inspire_hand_ws` directly. Fork it, pin `fc75490`, and patch
-one thing:
+The fork exists and the patch is done: **`panthera-momagdii/inspire_hand_ws`**, branch
+`panthera/pc2-headless`, based on `fc75490` (verified with `git ls-remote` to be the tip of
+`NaCl-1374/inspire_hand_ws` master). Do **not** install `NaCl-1374/inspire_hand_ws`
+directly.
 
-> `inspire_sdkpy/__init__.py` eagerly imports `ModbusDataHandler` **and** `qt_tabs`, so
-> importing the IDL drags in `pymodbus`, `pyqtgraph`, `PyQt5` and `colorcet`. There is no
-> import path around it — importing a submodule still runs the package `__init__`. PC2 is
-> a headless aarch64 Jetson; a Qt stack there is a long build and a pointless dependency.
+> At `fc75490`, `inspire_sdkpy/__init__.py` eagerly imported `ModbusDataHandler` **and**
+> `qt_tabs`, so importing the IDL dragged in `unitree_sdk2py`, `pyqtgraph`, `PyQt5` and
+> `colorcet`. There was no import path around it — importing a submodule still runs the
+> package `__init__`. PC2 is a headless aarch64 Jetson; a Qt stack there is a long build
+> and a pointless dependency.
 
-The patch is to make the Qt import lazy or optional, leaving `pymodbus` + the DDS IDL as
-the only hard requirements. Then:
+Patched: those four names now resolve through a PEP 562 `__getattr__` on first attribute
+access, and `setup.py` moves `PyQt5`/`pyqtgraph`/`colorcet` into `extras_require["gui"]`.
+`__all__` is unchanged and, with Qt present, the resolved package namespace is identical to
+pristine `fc75490`. See `README_PANTHERA.md` in the fork.
+
+`unitree_sdk2py` is a **prerequisite, not a dependency** — the bridge imports it to publish,
+but it is not on PyPI so it cannot go in `install_requires`. It should already be present on
+PC2 for `xr_teleoperate`. Check before anything else:
+
+```bash
+python -c "import unitree_sdk2py, cyclonedds; print('prereqs ok')"
+```
+
+Then:
 
 ```bash
 # on PC2, in the conda env (Python 3.10, conda-forge only -- the Anaconda default
 # channels demand a ToS acceptance, which is a licensing decision, not a technical one)
-pip install pymodbus==3.6.9
-pip install -e <our-fork>/inspire_hand_sdk --no-deps
+git clone https://github.com/panthera-momagdii/inspire_hand_ws.git ~/panthera/inspire_hand_ws
+cd ~/panthera/inspire_hand_ws && git checkout panthera/pc2-headless
+
+python -m pip install pymodbus==3.6.9
+python -m pip install inspire_hand_sdk --no-deps      # NOT -e -- see below
 python -c "from inspire_sdkpy import inspire_dds, inspire_hand_defaut; print('ok')"
 ```
+
+Two flags, both deliberate:
+
+* **`--no-deps` is required, not tidiness.** Upstream pins `cyclonedds==0.10.2`; without
+  `--no-deps` pip will try to move PC2's cyclonedds — the one `unitree_sdk2py` is already
+  using — onto that version. The pin was left alone on purpose; it is not testable from an
+  x86_64 laptop.
+* **No `-e`.** The fork is pinned and changes rarely, so an editable install buys nothing,
+  and pip's *default* editable mode actively breaks on this project. `inspire_hand_sdk` has
+  a `setup.py` and no `pyproject.toml`, so `pip install -e` uses setuptools' **strict** mode,
+  which does not put the source directory in the `.pth` file — it writes a
+  `build/__editable__.inspire_sdkpy-1.0.0-py3-none-any/` tree inside the project and points
+  the `.pth` at *that*. `build` is gitignored, so a `git clean` or the next reinstall round
+  removes it silently and the `.pth` dangles. The metadata still lives in site-packages, so
+  you get `pip show inspire_sdkpy` succeeding while `import inspire_sdkpy` raises
+  `ModuleNotFoundError` — which cost a debugging session on the laptop on 2026-09-01. A
+  plain install copies the package into site-packages and has none of this. Re-run the same
+  command after a `git pull`. If you ever do need `-e`, pass
+  `--config-settings editable_mode=compat`.
+
+Verified on the laptop in a bare Python 3.10 venv holding only `pymodbus==3.6.9`,
+`cyclonedds` and `numpy`, with `PyQt5`, `pyqtgraph`, `colorcet` and `unitree_sdk2py` all
+confirmed absent: the import above succeeds, the DDS types round-trip through CDR, and
+`angle_act` is 6-wide per hand — which is the 12-wide `dual_hand_state_array` after
+`concatenate(left, right)`.
+
+**Two upstream defects were found and deliberately not patched** (fixing them would change
+bridge behaviour):
+
+* `network='<nic>'` **is silently ignored.** The branch in `inspire_sdk.py:77-81` and
+  `inspire_sdk_double.py:73-77` is inverted, so both paths reach cyclonedds'
+  auto-determine. Set the NIC yourself instead, before constructing the handler, and pass
+  `initDDS=False`:
+
+  ```python
+  from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+  ChannelFactoryInitialize(0, "<robot-lan-nic>")   # once per process
+  handler = inspire_sdk.ModbusDataHandler(ip="192.168.123.210", LR="l",
+                                          device_id=1, initDDS=False)
+  ```
+
+  `CYCLONEDDS_URI` is **not** a workaround — the SDK builds `Domain(id, config)` with an
+  inline XML config, which takes precedence.
+
+* **A DDS init failure is swallowed** and `__init__` returns before `self.pub` exists, so
+  the constructor looks like it succeeded and the first `read()` raises
+  `AttributeError: ... has no attribute 'pub'`. If you see that, scroll up for
+  `Error during ChannelFactory initialization:`.
 
 No root is needed for any of this. The bridge talks TCP to the hands and DDS to the
 domain; it needs no kernel modules and no device nodes.
