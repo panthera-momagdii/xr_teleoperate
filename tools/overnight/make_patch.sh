@@ -47,7 +47,11 @@ fi
 git read-tree "$BASE"
 git add -- "$@"
 
-git diff "$BASE" --cached > "patches/${NAME}.patch"
+# --binary: without it a patch containing a binary file (G3 ships a .npz test fixture)
+# is emitted as an unusable "Binary files differ" stub and `git apply` refuses it with
+# "cannot apply binary patch ... without full index line". Harmless for text-only
+# patches, so it is unconditional.
+git diff --binary "$BASE" --cached > "patches/${NAME}.patch"
 
 # This gate's full tree becomes the next gate's baseline.
 NEW_TREE="$(git write-tree)"

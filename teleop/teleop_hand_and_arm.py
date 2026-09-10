@@ -16,6 +16,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController, R1_A5_ArmController, R1_A7_ArmController
 from teleop.robot_control import hand_config
+from teleop.robot_control import wrist_offset
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -212,6 +213,18 @@ if __name__ == '__main__':
         except Exception as exc:
             logger_mp.error(f"[xr] could not move vuer to port {_xr_port}: {exc}")
             sys.exit(EXIT_PORT_BUSY)
+
+    # [panthera] The operator-to-robot wrist mapping (G3). Resolved HERE, before any DDS
+    # init, so a typo in XR_WRIST_Z_SCALE stops the session while the robot still holds
+    # itself up rather than at the first frame after [r]. All four knobs default to the
+    # identity, and at the identity apply() is skipped entirely -- byte-for-byte the
+    # behaviour of the unmodified code.
+    try:
+        wrist_map = wrist_offset.from_env()
+    except ValueError as exc:
+        parser.error(str(exc))
+    notice(wrist_map.describe())
+    logger_mp.info(wrist_map.describe())
 
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
@@ -555,7 +568,15 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            # [panthera] Apply the wrist mapping between televuer and the IK. It belongs
+            # inside transform_IPunitree_Brobot_world_arm_to_head_then_waist(), but
+            # televuer is an upstream submodule and a change there cannot ship in a
+            # patch -- so it runs here on the same quantity instead. See
+            # teleop/robot_control/wrist_offset.py and docs/xr_frames.md.
+            # At the default knobs this returns the input object unchanged.
+            left_wrist_target, right_wrist_target = wrist_map.apply_pair(
+                tele_data.left_wrist_pose, tele_data.right_wrist_pose)
+            sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_target, right_wrist_target, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
