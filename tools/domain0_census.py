@@ -54,6 +54,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (  # noqa: E402
 
 from teleop.robot_control import hand_config  # noqa: E402
 from tools.tool_logging import timestamp  # noqa: E402
+from tools._procs import install_reaper, reap_child_processes  # noqa: E402
 
 EXIT_OK, EXIT_STOP, EXIT_EMPTY = 0, 3, 4
 
@@ -567,7 +568,16 @@ def _verdict(topic, rows, expected_lowcmd_ip):
 
 
 if __name__ == "__main__":
+    # [panthera] Importing hand_config above calls logging_mp.getLogger(), which forks a
+    # NON-DAEMON listener process that logging_mp only reaps from an atexit hook. This
+    # tool leaves via os._exit(), which skips atexit, so the listener was orphaned on
+    # every single run. Four of them were still alive on this host on 2026-09-09 --
+    # PPID 1, 2h43m to 4h08m past a --seconds 15..30 budget -- squatting on the DDS
+    # domain and holding the inherited stdout open, which is why the symptom looked
+    # like "census hung" rather than "census leaked". See tools/_procs.py.
+    install_reaper()
     rc = main()
     sys.stdout.flush()
     sys.stderr.flush()
+    reap_child_processes()          # os._exit() skips atexit; call it directly
     os._exit(rc)

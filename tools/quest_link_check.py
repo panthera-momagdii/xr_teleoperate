@@ -31,11 +31,16 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(REPO_ROOT)
 
 from televuer import TeleVuerWrapper  # noqa: E402
+from tools._procs import install_reaper, reap_child_processes  # noqa: E402
 
 EXIT_OK, EXIT_NO_CONNECT, EXIT_NO_HANDS = 0, 2, 3
+# [panthera] Same meaning as the launcher's exit 4, deliberately: "the port is taken".
+EXIT_PORT_BUSY = 4
 
 IMG_H, IMG_W = 480, 640
 VUER_PORT = 8012
+# vuer's own default, kept separate from VUER_PORT so --port can be compared against it.
+_VUER_DEFAULT_PORT = 8012
 
 
 def local_ips():
@@ -123,7 +128,47 @@ def main():
     parser.add_argument("--rate", type=float, default=5.0, help="print rate in Hz")
     parser.add_argument("--display-mode", default="immersive",
                         choices=["immersive", "ego", "pass-through"])
+    # [panthera] So this can run on 8013 while a launcher owns 8012. Before this, the
+    # two fought for the port and vuer's loser failed its bind inside an aiohttp thread
+    # that neither program noticed -- which is how a launcher ended up running with a
+    # dead XR path on 2026-09-09.
+    parser.add_argument("--port", type=int, default=VUER_PORT,
+                        help=f"TCP port to serve on (default {VUER_PORT}). Use a "
+                             f"different one to run alongside a launcher.")
     args = parser.parse_args()
+    port = args.port
+
+    # [panthera] Reap logging_mp's non-daemon listener fork on every exit path. This
+    # tool leaves via os._exit(), which skips atexit, so without install_reaper() the
+    # fork is orphaned -- it keeps the PORT and the inherited stdout open, and the NEXT
+    # run of anything that wants 8012 fails. See tools/_procs.py for the measured
+    # evidence.
+    install_reaper()
+
+    # Refuse rather than fight: an in-use port here means a bind failure inside vuer's
+    # own thread, which this tool would not notice either.
+    # [panthera] How the port is actually moved.
+    #
+    # televuer is an upstream git SUBMODULE (unitreerobotics/televuer, pinned at
+    # 766de45), and TeleVuer.__init__ constructs `Vuer(host='0.0.0.0', ...)` with no
+    # port argument, so vuer takes its own class default. Threading a `port=` parameter
+    # through televuer would be the tidy fix, but it would have to be carried as a
+    # separate submodule patch that a `git submodule update` silently reverts.
+    #
+    # vuer's Vuer is a params_proto class, so its port IS the class attribute:
+    # setting it before construction is exactly equivalent to passing port=, and it
+    # lives entirely in this repo. Verified both routes give the same instance port.
+    from vuer import Vuer as _Vuer
+    _default_port = _VUER_DEFAULT_PORT
+    if port != _default_port:
+        _Vuer.port = port
+
+    from tools import port_guard
+    if not port_guard.port_is_free(port):
+        print(port_guard.describe_busy(port), file=sys.stderr)
+        print(f"\nrefusing to start: vuer needs {port} and cannot have it. "
+              f"Use --port to pick another.", file=sys.stderr)
+        return EXIT_PORT_BUSY
 
     # Line buffering: this tool spends most of its life waiting, and an operator staring
     # at a redirected log needs the countdown as it happens, not in one burst at exit.
@@ -150,7 +195,7 @@ def main():
         print("\nNo non-loopback IPv4 address found. Is this laptop on a network?")
     print("\nOpen ONE of these on the Quest (accept the certificate warning):")
     for ip in ips:
-        print(f"    https://{ip}:{VUER_PORT}/?ws=wss://{ip}:{VUER_PORT}")
+        print(f"    https://{ip}:{port}/?ws=wss://{ip}:{port}")
     print()
 
     wrapper = TeleVuerWrapper(
@@ -192,16 +237,16 @@ def main():
             if connected_at is None and (moved or data.motion_data_ready):
                 connected_at = now
                 print(f"websocket is connected  (after {now - started:.1f} s; "
-                      f"TCP peers on {VUER_PORT}: {established_peers() or 'none visible'})")
+                      f"TCP peers on {port}: {established_peers(port) or 'none visible'})")
                 print(f"\n  {'t':>6}  {'head':<26} {'L wrist':<26} {'R wrist':<26} "
                       f"{'ready':<6} {'pinch L':>8} {'pinch R':>8}")
 
             if connected_at is None:
-                peers_ever.update(established_peers())
+                peers_ever.update(established_peers(port))
                 if now - started >= args.timeout:
-                    peers = established_peers()
+                    peers = established_peers(port)
                     print(f"\nTIMEOUT after {args.timeout:g} s: no XR data arrived.")
-                    print(f"  ESTABLISHED TCP peers on port {VUER_PORT} right now: "
+                    print(f"  ESTABLISHED TCP peers on port {port} right now: "
                           f"{peers or 'none'}")
                     print(f"  peers seen at any point during the wait: "
                           f"{sorted(peers_ever) or 'none'}")
@@ -217,8 +262,8 @@ def main():
                 if now - last_note >= 5.0:
                     last_note = now
                     print(f"  waiting... {args.timeout - (now - started):5.0f} s left"
-                          f"   TCP peers on {VUER_PORT} now: "
-                          f"{established_peers() or 'none'}"
+                          f"   TCP peers on {port} now: "
+                          f"{established_peers(port) or 'none'}"
                           f"   ever: {sorted(peers_ever) or 'none'}")
                 time.sleep(0.1)
                 continue
@@ -259,4 +304,8 @@ if __name__ == "__main__":
     code = main()
     sys.stdout.flush()
     sys.stderr.flush()
+    # [panthera] os._exit() skips atexit, so the reaper registered by install_reaper()
+    # never runs on THIS path. Call it directly. Bounded, and everything that matters
+    # is already flushed above.
+    reap_child_processes()
     os._exit(code)

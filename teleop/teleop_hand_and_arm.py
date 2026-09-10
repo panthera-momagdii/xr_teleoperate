@@ -119,6 +119,16 @@ if __name__ == '__main__':
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
 
+    # [panthera] logging_mp forks a NON-DAEMON listener on the first getLogger() and
+    # reaps it only from an atexit hook. Ctrl-C and `kill` do not run atexit reliably
+    # here, and the orphan inherits the LISTENING SOCKET on 8012 -- so a launcher that
+    # is killed leaves a process squatting on the port, and the NEXT launcher refuses
+    # to start with exit 4. Four such orphans accumulated while this gate was being
+    # written. install_reaper() covers atexit + SIGINT + SIGTERM; nothing can cover
+    # SIGKILL, which is why the exit-4 message names the PID to kill.
+    from tools._procs import install_reaper, reap_child_processes
+    install_reaper(log=logger_mp)
+
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
 
@@ -187,6 +197,21 @@ if __name__ == '__main__':
     else:
         notice(f"[xr] port {_xr_port} is free")
         logger_mp.info(f"[xr] port {_xr_port} is free")
+
+    # [panthera] Make XR_VUER_PORT move the BIND, not just the check -- checking one
+    # port and serving another would be worse than having no knob at all. televuer is
+    # an upstream submodule and constructs Vuer() with no port argument, so the port is
+    # vuer's params_proto class attribute; setting it here is equivalent to passing
+    # port= and needs no submodule change. Left alone at the default, so the ordinary
+    # path constructs exactly the Vuer it always did.
+    if _xr_port != 8012:
+        try:
+            from vuer import Vuer as _VuerCls
+            _VuerCls.port = _xr_port
+            logger_mp.info(f"[xr] vuer will serve on {_xr_port} (XR_VUER_PORT)")
+        except Exception as exc:
+            logger_mp.error(f"[xr] could not move vuer to port {_xr_port}: {exc}")
+            sys.exit(EXIT_PORT_BUSY)
 
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
@@ -755,6 +780,11 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+        try:
+            reap_child_processes(log=logger_mp)
+        except Exception as e:
+            logger_mp.error(f"Failed to reap child processes: {e}")
+
         logger_mp.info("✅ Finally, exiting program.")
         # [panthera] exit_code wins when a pre-flight refused, so the caller learns
         # WHICH check failed (3 = no ee state, 4 = port busy) instead of a flat 1.
