@@ -154,6 +154,50 @@ DEX5_MAX_STEP_RAD = float(os.environ.get("DEX5_MAX_STEP_RAD", "0.05"))
 DEX5_LIMIT_MARGIN_RAD = float(os.environ.get("DEX5_LIMIT_MARGIN_RAD", "0.001"))
 
 
+# --- Inspire slew ----------------------------------------------------------
+# [panthera] The Inspire lane's equivalent of DEX5_MAX_STEP_RAD, in the hand's own
+# units instead of radians.
+#
+# The RH56 command space is a flat integer 0..1000 per finger (0 = fully bent,
+# 1000 = fully open; tools/fake_inspire_state.py:11-13, RH56DFTP manual). There are no
+# URDF travel limits to shrink here the way the Dex5 lane shrinks its own -- the clamp
+# is just the ends of that range -- so only the rate needs a knob.
+#
+# 1500 units/s is deliberately conservative: at the controller's 100 Hz that is 15
+# units per cycle, and a full-travel move takes 1000/1500 = 0.67 s. Fast enough to be
+# usable, slow enough that a bad retarget frame cannot snap a finger shut.
+INSPIRE_UNITS_MIN = 0
+INSPIRE_UNITS_MAX = 1000
+INSPIRE_SLEW_UNITS_PER_S = float(os.environ.get("XR_HAND_SLEW", "1500"))
+if not (INSPIRE_SLEW_UNITS_PER_S > 0):
+    raise RuntimeError(
+        f"XR_HAND_SLEW={INSPIRE_SLEW_UNITS_PER_S} must be > 0 units/s. "
+        f"The hand's command space is {INSPIRE_UNITS_MIN}..{INSPIRE_UNITS_MAX}; "
+        f"1500 units/s is full travel in {INSPIRE_UNITS_MAX / 1500.0:.2f}s at 100 Hz.")
+
+
+def inspire_max_step(fps):
+    """Units of command change allowed per control cycle at `fps`."""
+    return INSPIRE_SLEW_UNITS_PER_S / float(fps)
+
+
+def limit_inspire_command(target_units, last_cmd_units, fps):
+    """Slew toward `target_units`, then clamp to 0..1000. Returns a float array.
+
+    [panthera] Ported from Dex5_1_Controller._limit_command
+    (robot_hand_unitree.py:180-189). Order matters and is the same: the slew is measured
+    against the previous COMMAND, so clamping afterwards can never produce a step larger
+    than the slew allows -- clamping only ever moves a value back toward the interior,
+    i.e. back toward last_cmd.
+    """
+    import numpy as _np
+    step = inspire_max_step(fps)
+    target = _np.asarray(target_units, dtype=float)
+    last = _np.asarray(last_cmd_units, dtype=float)
+    cmd = _np.clip(target, last - step, last + step)
+    return _np.clip(cmd, INSPIRE_UNITS_MIN, INSPIRE_UNITS_MAX)
+
+
 # Which --ee value implies which hand model. The launcher derives the model from --ee so
 # the two cannot disagree silently: choosing an end effector IS choosing a hand, and
 # having to remember a matching env var is a way to command a Dex5's topics with an

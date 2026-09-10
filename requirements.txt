@@ -2,3 +2,11 @@ matplotlib==3.7.5
 rerun-sdk==0.20.1
 meshcat==0.3.2
 sshkeyboard==2.3.1
+
+# [panthera] Pinned 2026-09-09. vuer's CLI layer is params_proto, and it is what
+# intercepts --help on the launcher (which is why 'teleop_hand_and_arm.py --help'
+# prints only Vuer.* options). 2.13.2 is the version this host has been proven on:
+# every gate S0-S5 and the Sep 9 robot session ran against it. Later releases have
+# changed the argv-parsing behaviour that vuer relies on, and an unpinned upgrade
+# would first show up as the launcher failing to start on a robot day.
+params_proto==2.13.2

@@ -58,37 +58,6 @@ class Inspire_Controller_DFX:
 
         logger_mp.info("Initialize Inspire_Controller_DFX OK!")
 
-    def _on_state(self, side):
-        """[panthera] One callback per side: validate, record, and surface faults.
-
-        Anything raised in here happens on a DDS callback thread, where it would be
-        swallowed. It is stored instead and re-raised by the wait loop, so a dead
-        subscriber cannot look like "still waiting".
-        """
-        array = self.left_hand_state_array if side == "left" else self.right_hand_state_array
-
-        def handler(msg):
-            try:
-                n_dof, _ = hand_config.read_hand_counts(msg)
-                if side not in self._logged_first:
-                    self._logged_first.add(side)
-                    # The whole first message, once. On the next visit this is the first
-                    # real look at these hands -- err/status/temperature included, which
-                    # upstream reads and throws away.
-                    logger_mp.info(f"[Inspire_Controller_FTP] {side} hand first state: "
-                                   f"{hand_config.describe_state(msg)}")
-                hand_config.check_motor_count(side, n_dof)
-                hand_config.check_hand_health(side, msg)
-                with array.get_lock():
-                    for i in range(Inspire_Num_Motors):
-                        array[i] = msg.angle_act[i] / 1000.0
-                self._state_seen[side] = True
-            except BaseException as exc:
-                if self._subscribe_error is None:
-                    self._subscribe_error = exc
-
-        return handler
-
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """
         Set current left, right hand motor state target q
@@ -271,6 +240,47 @@ class Inspire_Controller_FTP:
 
         logger_mp.info("Initialize Inspire_Controller_FTP OK!\n")
 
+    # [panthera] _on_state used to sit in Inspire_Controller_DFX, above. It was written
+    # for THIS class -- its log lines say "[Inspire_Controller_FTP]" and it uses
+    # self._logged_first / _state_seen / _subscribe_error, which only this class
+    # initialises -- so it was dead where it was and missing where it was needed, and
+    # `--ee inspire_ftp` died at construction with
+    #     AttributeError: 'Inspire_Controller_FTP' object has no attribute '_on_state'
+    # The Sep 9 session ran arms-only, so nothing hit it. inspire_ftp is the hand
+    # ACTUALLY FITTED to this robot, so it would have been the first thing to fail on
+    # the next visit. Found by driving the real controller against
+    # tools/fake_inspire_state.py in tools/overnight/test_g5_inspire_slew.py.
+    def _on_state(self, side):
+        """[panthera] One callback per side: validate, record, and surface faults.
+
+        Anything raised in here happens on a DDS callback thread, where it would be
+        swallowed. It is stored instead and re-raised by the wait loop, so a dead
+        subscriber cannot look like "still waiting".
+        """
+        array = self.left_hand_state_array if side == "left" else self.right_hand_state_array
+
+        def handler(msg):
+            try:
+                n_dof, _ = hand_config.read_hand_counts(msg)
+                if side not in self._logged_first:
+                    self._logged_first.add(side)
+                    # The whole first message, once. On the next visit this is the first
+                    # real look at these hands -- err/status/temperature included, which
+                    # upstream reads and throws away.
+                    logger_mp.info(f"[Inspire_Controller_FTP] {side} hand first state: "
+                                   f"{hand_config.describe_state(msg)}")
+                hand_config.check_motor_count(side, n_dof)
+                hand_config.check_hand_health(side, msg)
+                with array.get_lock():
+                    for i in range(Inspire_Num_Motors):
+                        array[i] = msg.angle_act[i] / 1000.0
+                self._state_seen[side] = True
+            except BaseException as exc:
+                if self._subscribe_error is None:
+                    self._subscribe_error = exc
+
+        return handler
+
     def _subscribe_hand_state(self):
         logger_mp.info("[Inspire_Controller_FTP] Subscribe thread started.")
         while True:
@@ -327,6 +337,33 @@ class Inspire_Controller_FTP:
         left_q_target  = np.full(Inspire_Num_Motors, 1.0)
         right_q_target = np.full(Inspire_Num_Motors, 1.0)
 
+        # [panthera] FIRST-COMMAND RAMP. left_q_target above is 1.0 = FULLY OPEN, and it
+        # was published every cycle from the moment this process started -- before any
+        # XR data had arrived. So the very first command told the hand to snap to the
+        # open pose from wherever it actually was, and the first frame of real operator
+        # data snapped it again to the operator's pose. Both are full-travel steps.
+        #
+        # The slew instead starts from where the hand ACTUALLY IS. __init__ has already
+        # waited for a valid first state on both sides, so these arrays are populated;
+        # they hold angle_act/1000, i.e. normalised 0..1, so x1000 puts them back in the
+        # hand's own 0..1000 command units.
+        #
+        # Ported from Dex5_1_Controller.control_process (robot_hand_unitree.py:254-269).
+        left_last_cmd = np.clip(
+            np.array(left_hand_state_array[:], dtype=float) * 1000.0,
+            hand_config.INSPIRE_UNITS_MIN, hand_config.INSPIRE_UNITS_MAX)
+        right_last_cmd = np.clip(
+            np.array(right_hand_state_array[:], dtype=float) * 1000.0,
+            hand_config.INSPIRE_UNITS_MIN, hand_config.INSPIRE_UNITS_MAX)
+        logger_mp.info(
+            f"[Inspire_Controller_FTP] slew starts from the measured state: "
+            f"left={np.round(left_last_cmd, 1).tolist()}, "
+            f"right={np.round(right_last_cmd, 1).tolist()}; "
+            f"max {hand_config.inspire_max_step(self.fps):.1f} units/cycle "
+            f"({hand_config.INSPIRE_SLEW_UNITS_PER_S:g} units/s at {self.fps:g} Hz, "
+            f"env XR_HAND_SLEW), full travel in "
+            f"{hand_config.INSPIRE_UNITS_MAX / hand_config.INSPIRE_SLEW_UNITS_PER_S:.2f}s")
+
         try:
             while self.running:
                 start_time = time.time()
@@ -365,8 +402,19 @@ class Inspire_Controller_FTP:
                             left_q_target[idx]  = normalize(left_q_target[idx], -0.1, 1.3)
                             right_q_target[idx] = normalize(right_q_target[idx], -0.1, 1.3)
 
-                scaled_left_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in left_q_target]
-                scaled_right_cmd = [int(np.clip(val * 1000, 0, 1000)) for val in right_q_target]
+                # [panthera] Slew-limit toward the retargeted pose, then clamp to the
+                # hand's 0..1000 range. Was an unlimited `int(np.clip(val*1000, 0, 1000))`
+                # straight from the retargeter, so any jump in the operator's hand pose
+                # -- including the very first frame, and including a single bad
+                # retargeting frame -- went to the fingers at full speed.
+                left_last_cmd = hand_config.limit_inspire_command(
+                    np.asarray(left_q_target, dtype=float) * 1000.0,
+                    left_last_cmd, self.fps)
+                right_last_cmd = hand_config.limit_inspire_command(
+                    np.asarray(right_q_target, dtype=float) * 1000.0,
+                    right_last_cmd, self.fps)
+                scaled_left_cmd = [int(round(v)) for v in left_last_cmd]
+                scaled_right_cmd = [int(round(v)) for v in right_last_cmd]
 
                 # get dual hand action
                 action_data = np.concatenate((left_q_target, right_q_target))

@@ -62,8 +62,17 @@ def run_preflight_case(args):
         print(f"RESULT: preflight refused after {elapsed:.2f}s")
         print(f"RESULT: RuntimeError: {exc}")
         if args.case == "silent":
+            # [panthera] Was `"no HandState_" in str(exc)`. The product stopped saying
+            # that when the wording moved into hand_config.state_timeout_error(), so
+            # this case reported False on a correct refusal -- it was the only red in
+            # the suite for weeks, on both hand lanes. The line above the print claims
+            # the message "names both topics", so assert exactly that, against the
+            # topics hand_config is actually configured for. A phrase match would go
+            # stale again the next time the wording changes; a topic match cannot.
             ok = (abs(elapsed - hand_config.STATE_TIMEOUT_S) <= 1.0
-                  and "no HandState_" in str(exc))
+                  and "no hand state on" in str(exc)
+                  and hand_config.TOPIC_LEFT_STATE in str(exc)
+                  and hand_config.TOPIC_RIGHT_STATE in str(exc))
             print(f"RESULT: within timeout +/-1s and names both topics: {ok}")
         elif args.case == "dex3":
             ok = "motor_state has 7 entries" in str(exc)
@@ -202,7 +211,11 @@ def main():
         print(f"RESULT: refused after {elapsed:.2f}s")
         print(f"RESULT: RuntimeError: {exc}")
         if args.case == "silent":
-            ok = abs(elapsed - hand_config.STATE_TIMEOUT_S) <= 1.0 and "no HandState_" in str(exc)
+            # [panthera] Same stale assertion as in run_preflight_case; see there.
+            ok = (abs(elapsed - hand_config.STATE_TIMEOUT_S) <= 1.0
+                  and "no hand state on" in str(exc)
+                  and hand_config.TOPIC_LEFT_STATE in str(exc)
+                  and hand_config.TOPIC_RIGHT_STATE in str(exc))
             print(f"RESULT: within timeout +/-1s and names both topics: {ok}")
         elif args.case == "dex3":
             ok = "motor_state has 7 entries" in str(exc)
