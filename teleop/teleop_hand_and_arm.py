@@ -17,6 +17,7 @@ from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController, R1_A5_ArmController, R1_A7_ArmController
 from teleop.robot_control import hand_config
 from teleop.robot_control import wrist_offset
+from teleop.robot_control import start_pose as start_pose_mod
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -226,6 +227,23 @@ if __name__ == '__main__':
     notice(wrist_map.describe())
     logger_mp.info(wrist_map.describe())
 
+    # [panthera] Read here rather than beside set_arm_velocity_limit(): it is pure env,
+    # and the start-pose sequencer below needs it before any DDS exists.
+    arm_velocity_limit = float(os.environ.get("XR_ARM_VEL_LIMIT", "30.0"))
+
+    # [panthera] The fixed start pose (G4). A pose FILE is a static input like the port
+    # and the wrist knobs, so it is parsed and refused HERE -- before ChannelFactory-
+    # Initialize and long before Enter_Debug_Mode. A typo in the YAML must not cost a
+    # go-home with the arms released. The pose is re-checked against the real URDF joint
+    # limits once the IK model exists; this pass catches everything that does not need
+    # the model (missing joints, extra joints, nan, unreadable file).
+    try:
+        start_seq = start_pose_mod.from_env(velocity_limit=arm_velocity_limit)
+    except start_pose_mod.StartPoseError as exc:
+        parser.error(str(exc))
+    notice(start_seq.describe())
+    logger_mp.info(start_seq.describe())
+
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
     # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:
@@ -363,7 +381,7 @@ if __name__ == '__main__':
         # in the constructor with no way to lower it; hardware sessions run XR_ARM_VEL_LIMIT=5
         # until we trust the mapping. Default is unchanged, so behaviour without the env var
         # is exactly upstream's.
-        arm_velocity_limit = float(os.environ.get("XR_ARM_VEL_LIMIT", "30.0"))
+        # arm_velocity_limit was read before the try (the start-pose sequencer needs it).
         if hasattr(arm_ctrl, "set_arm_velocity_limit"):
             arm_ctrl.set_arm_velocity_limit(arm_velocity_limit)
             logger_mp.info(f"[arm] velocity limit set to {arm_velocity_limit} rad/s "
@@ -371,6 +389,26 @@ if __name__ == '__main__':
         else:
             logger_mp.warning(f"[arm] {type(arm_ctrl).__name__} has no set_arm_velocity_limit; "
                               f"XR_ARM_VEL_LIMIT={arm_velocity_limit} NOT applied")
+
+        # [panthera] Now that the IK model exists, re-check the start pose against the
+        # REAL URDF joint limits. The early parse could not do this without building the
+        # model twice. A pose outside the limits would be clipped by the controller into
+        # something nobody chose, so it is refused instead.
+        if start_seq.enabled:
+            try:
+                _model = arm_ik.reduced_robot.model
+                start_pose_mod.load_pose(
+                    os.environ["XR_START_POSE"],
+                    joint_limits=(_model.lowerPositionLimit, _model.upperPositionLimit))
+                logger_mp.info("[start-pose] inside every URDF joint limit")
+            except start_pose_mod.StartPoseError as exc:
+                notice(f"[start-pose] REFUSING TO START\n    {exc}")
+                logger_mp.error(str(exc))
+                exit_code = 2
+                raise SystemExit(2)
+            except Exception as exc:
+                # Never block a session because the limit CHECK itself broke.
+                logger_mp.warning(f"[start-pose] could not re-check joint limits: {exc}")
 
         # end-effector
         if args.ee in ("dex3", "dex5", "inspire_ftp", "inspire_dfx") and args.input_mode == "controller":
@@ -481,7 +519,15 @@ if __name__ == '__main__':
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
 
+        notice("--------------------- start Tracking -------------------------")
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+
+        # [panthera] Arm the start-pose sequence from where the arms ACTUALLY ARE at the
+        # moment [r] was pressed, not from a reading taken earlier.
+        if start_seq.enabled and not STOP:
+            start_seq.start(time.monotonic(), arm_ctrl.get_current_dual_arm_q())
+            notice(f"[start-pose] approaching over {start_seq.start_t:g}s, "
+                   f"then blending to the operator over {start_seq.blend_t:g}s")
 
         head_img = None
         left_wrist_img = None
@@ -579,7 +625,14 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_target, right_wrist_target, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            # [panthera] Start-pose sequence (G4). Pass-through unless XR_START_POSE is
+            # set. sol_tauff is the gravity feed-forward computed FOR sol_q, so it is
+            # zeroed whenever the commanded q is not sol_q -- a torque computed for a
+            # pose the arm is not in is worse than no feed-forward at all.
+            cmd_q = start_seq.step(time.monotonic(), current_lr_arm_q, sol_q,
+                                   dt=1.0 / args.frequency)
+            cmd_tauff = sol_tauff if cmd_q is sol_q else sol_tauff * 0.0
+            arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tauff)
 
             # record data
             if args.record:
