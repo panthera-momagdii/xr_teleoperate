@@ -11,7 +11,8 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True,
+                 source = None, joint_names = None):
         """
         image_size: [width, height]
         """
@@ -31,6 +32,14 @@ class EpisodeWriter():
 
         self.frequency = frequency
         self.image_size = image_size
+
+        # [panthera] What produced this episode. Upstream's info block records the image
+        # geometry and an all-empty joint_names, so an episode on disk does not say which
+        # robot, which end effector, or whether there WAS an end effector -- and an
+        # arms-only episode (no --ee, a supported and now routine mode) is indistinguishable
+        # from one where the hand block failed to record. Both are written now.
+        self.source = dict(source or {})
+        self.joint_names = dict(joint_names or {})
 
         self.rerun_log = rerun_log
         if self.rerun_log:
@@ -71,13 +80,15 @@ class EpisodeWriter():
                 "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
                 "depth": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
                 "audio": {"sample_rate": 16000, "channels": 1, "format":"PCM", "bits":16},    # PCM_S16
-                "joint_names":{
-                    "left_arm":   [],
-                    "left_ee":  [],
-                    "right_arm":  [],
-                    "right_ee": [],
-                    "body":       [],
+                "joint_names": {
+                    "left_arm":  list(self.joint_names.get("left_arm", [])),
+                    "left_ee":   list(self.joint_names.get("left_ee", [])),
+                    "right_arm": list(self.joint_names.get("right_arm", [])),
+                    "right_ee":  list(self.joint_names.get("right_ee", [])),
+                    "body":      list(self.joint_names.get("body", [])),
                 },
+                # [panthera] arm, ee, input_mode, and end_effector.present -- see __init__.
+                "source": dict(self.source),
 
                 "tactile_names": {
                     "left_ee": [],
@@ -167,8 +178,18 @@ class EpisodeWriter():
         audios = item_data.get('audios', {})
 
         # Save images
+        # [panthera] An unwritable image must cost that IMAGE, not the whole item.
+        # cv2.imwrite raises on an empty array, _process_item_data had no guard, and
+        # process_queue's except drops the entire item_data -- so one bad frame threw
+        # away that timestep's joint states and actions too. Offline, where every frame
+        # is empty, this silently produced an episode with "data": [].
         if colors:
-            for idx_color, (color_key, color) in enumerate(colors.items()):
+            for idx_color, (color_key, color) in enumerate(list(colors.items())):
+                if color is None or getattr(color, "size", 0) == 0:
+                    logger_mp.info(f"==> item {idx}: color '{color_key}' is empty; "
+                                   f"dropping the image, keeping the item.")
+                    item_data['colors'].pop(color_key, None)
+                    continue
                 color_name = f'{str(idx).zfill(6)}_{color_key}.jpg'
                 if not cv2.imwrite(os.path.join(self.color_dir, color_name), color):
                     logger_mp.info(f"Failed to save color image.")

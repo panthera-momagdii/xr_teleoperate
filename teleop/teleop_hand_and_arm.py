@@ -488,12 +488,42 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
+            # [panthera] Record WHAT produced the episode. --record is independent of
+            # --ee, and arms-only recording is a supported, now routine mode -- but with
+            # an all-empty joint_names block an arms-only episode on disk was
+            # indistinguishable from one where the hand block silently failed to record.
+            # ee_present is the flag that tells them apart; the joint names make the
+            # arrays self-describing.
+            _ee_dof = {"dex5": 20, "dex3": 7, "dex1": 1, "dex1_internal": 1,
+                       "inspire_ftp": 6, "inspire_dfx": 6, "brainco": 6}.get(args.ee, 0)
+            _ee_names = {
+                "inspire_ftp": list(hand_config.DOF_NAMES),
+                "inspire_dfx": list(hand_config.DOF_NAMES),
+            }.get(args.ee, [f"{args.ee}_{i}" for i in range(_ee_dof)] if args.ee else [])
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
-                                     rerun_log = not args.headless)
+                                     rerun_log = not args.headless,
+                                     source = {
+                                         "arm": args.arm,
+                                         "ee": args.ee,
+                                         "input_mode": args.input_mode,
+                                         "sim": bool(args.sim),
+                                         "end_effector": {
+                                             "present": args.ee is not None,
+                                             "name": args.ee,
+                                             "dof_per_side": _ee_dof,
+                                         },
+                                     },
+                                     joint_names = {
+                                         "left_arm":  list(start_pose_mod.ARM_JOINT_NAMES[:7]),
+                                         "right_arm": list(start_pose_mod.ARM_JOINT_NAMES[7:]),
+                                         "left_ee":   _ee_names,
+                                         "right_ee":  _ee_names,
+                                         "body":      [],
+                                     })
 
         # [panthera] The key prompt goes through notice() as well as the log. rich wraps
         # the logged copy and injects its source-location gutter mid-sentence, so
@@ -705,34 +735,45 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     colors = {}
                     depths = {}
+
+                    # [panthera] `img is not None` was not enough: ImageClient returns a
+                    # frame OBJECT whose .bgr can itself be None (no image server, or a
+                    # dropped frame). That put an empty array into colors, cv2.imwrite
+                    # raised, and EpisodeWriter.process_queue dropped THE WHOLE ITEM --
+                    # joint data included. Recording offline produced an episode with
+                    # "data": [] and a cheerful "Episode saved successfully".
+                    # Measured: 149 items recorded, 149 items lost.
+                    def _usable(frame):
+                        return frame is not None and getattr(frame, "bgr", None) is not None
+
                     if camera_config['head_camera']['binocular']:
-                        if head_img is not None:
+                        if _usable(head_img):
                             colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
                             colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
+                            if _usable(left_wrist_img):
                                 colors[f"color_{2}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
+                            if _usable(right_wrist_img):
                                 colors[f"color_{3}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
                     else:
-                        if head_img is not None:
+                        if _usable(head_img):
                             colors[f"color_{0}"] = head_img.bgr
                         else:
                             logger_mp.warning("Head image is None!")
                         if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
+                            if _usable(left_wrist_img):
                                 colors[f"color_{1}"] = left_wrist_img.bgr
                             else:
                                 logger_mp.warning("Left wrist image is None!")
                         if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
+                            if _usable(right_wrist_img):
                                 colors[f"color_{2}"] = right_wrist_img.bgr
                             else:
                                 logger_mp.warning("Right wrist image is None!")
