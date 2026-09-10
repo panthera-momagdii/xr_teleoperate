@@ -520,6 +520,172 @@ def preflight(timeout_s=None, log=None):
         gc.collect()
 
 
+# ---------------------------------------------------------------------------
+# [panthera] Generic end-effector state pre-flight, for EVERY --ee family.
+# ---------------------------------------------------------------------------
+# preflight() above is the rich check, and it only knows the two hands in MODELS.
+# The other five --ee families each build a controller that waits for its state topic
+# in an UNBOUNDED loop, so a missing end effector hangs the launcher forever instead of
+# refusing:
+#
+#   Dex1_1_Gripper_Controller   robot_hand_unitree.py:589-591   while not ready: sleep
+#   Dex3_1_Controller           robot_hand_unitree.py:383-387   while True: if any(...)
+#   Inspire_Controller_DFX      robot_hand_inspire.py:47-51     while True: if any(...)
+#   Brainco_Controller_ctrl     robot_hand_brainco.py:56-58     while not ready: sleep
+#   Brainco_Controller_hand     robot_hand_brainco.py:207-209   while not ready: sleep
+#
+# That is the 2026-09-09 `--ee dex1` hang: this robot has no Dex1 gripper, so
+# "[Dex1_1_Gripper_Controller] Waiting to subscribe dds..." repeated at 100 Hz until
+# the operator gave up. The controllers are upstream's and are left alone; the launcher
+# now runs this bounded check first and exits 3 instead of hanging.
+#
+# The topic literals are duplicated here rather than imported, because importing
+# robot_hand_unitree pulls in dex_retargeting and its asset files, which hand_config
+# must never require -- the read-only probes depend on hand_config staying cheap.
+# tools/overnight/test_g1_failfast.py asserts this table equals the controllers'
+# own constants, so the duplication cannot drift silently.
+
+EE_STATE_TOPICS = {
+    "dex1": {
+        "topics": ("rt/dex1/left/state", "rt/dex1/right/state"),
+        "idl": "motor_states",
+        "who": "Dex1_1_Gripper_Controller",
+        "what": "the Dex1 parallel gripper",
+    },
+    "dex3": {
+        "topics": ("rt/dex3/left/state", "rt/dex3/right/state"),
+        "idl": "hand_state",
+        "who": "Dex3_1_Controller",
+        "what": "the Dex3-1 hands",
+    },
+    "inspire_dfx": {
+        # One topic for BOTH hands, unlike every other family.
+        "topics": ("rt/inspire/state",),
+        "idl": "motor_states",
+        "who": "Inspire_Controller_DFX",
+        "what": "the Inspire DFX hands",
+    },
+    "brainco": {
+        "topics": ("rt/brainco/left/state", "rt/brainco/right/state"),
+        "idl": "motor_states",
+        "who": "Brainco_Controller_hand / Brainco_Controller_ctrl",
+        "what": "the BrainCo hands",
+    },
+    # Handled by preflight() instead, which also checks motor counts and health:
+    #   "dex5", "inspire_ftp"
+    # No end-effector topic of its own -- the gripper is driven from the arm's own
+    # motors and its readiness is the arm's lowstate, which G1_29_Arm_Internal_Dex1_
+    # Controller already bounds via dds_utils.wait_for_dds(timeout=5.0):
+    #   "dex1_internal"
+}
+
+# How long to wait for an end-effector state topic before refusing. Separate from
+# HAND_STATE_TIMEOUT_S so an operator can lengthen the Inspire bridge's grace period
+# without also lengthening this, and vice versa.
+EE_STATE_WAIT_S = float(os.environ.get("XR_HAND_WAIT_S", "10"))
+
+
+def _idl_for(kind):
+    """Lazily import the DDS type for one topic family.
+
+    Lazy for the same reason state_type() is: importing hand_config must not require
+    the Unitree channel machinery, and on a laptop without inspire_sdkpy the other
+    lanes must still work.
+    """
+    if kind == "motor_states":
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
+        return MotorStates_
+    if kind == "hand_state":
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+        return HandState_
+    raise RuntimeError(f"unknown idl kind {kind!r}")
+
+
+def ee_state_timeout_error(ee, timeout_s, missing, spec):
+    """The single wording for "an --ee was asked for and its state never arrived"."""
+    topics = ", ".join(missing)
+    return RuntimeError(
+        f"[ee preflight] --ee {ee}: no state on {topics} within {timeout_s}s. "
+        f"{spec['who']} would wait for this forever. "
+        f"Either {spec['what']} is not present/powered on this robot, or the DDS "
+        f"domain or --network-interface is wrong (discovery is per interface). "
+        f"If this robot has no {ee} end effector, run WITHOUT --ee: arms-only "
+        f"teleoperation is a supported mode and is what the Sep 9 session used.")
+
+
+def ee_state_preflight(ee, timeout_s=None, log=None):
+    """Confirm an --ee's state topic(s) are live. Read-only, bounded, closes its readers.
+
+    Returns the set of topics seen (empty for an --ee with no topic of its own, and for
+    ee=None). Raises RuntimeError naming the silent topics on timeout.
+
+    Called by the launcher BEFORE MotionSwitcher().Enter_Debug_Mode() for exactly the
+    reason preflight() is: once debug mode is entered, refusing costs a go-home with
+    the arms released.
+
+    ChannelFactoryInitialize must already have been called by the caller.
+    """
+    import gc
+    from unitree_sdk2py.core.channel import ChannelSubscriber
+
+    if log is None:
+        log = logger_mp
+    if timeout_s is None:
+        timeout_s = EE_STATE_WAIT_S
+
+    spec = EE_STATE_TOPICS.get(ee)
+    if spec is None:
+        return set()                      # ee is None, dex1_internal, or a MODELS lane
+
+    idl = _idl_for(spec["idl"])
+    seen = set()
+
+    def handler(topic):
+        def on_state(msg):
+            if topic not in seen:
+                seen.add(topic)
+                log.info(f"[ee preflight] first state on {topic}")
+        return on_state
+
+    subs = {}
+    try:
+        for topic in spec["topics"]:
+            sub = ChannelSubscriber(topic, idl)
+            sub.Init(handler(topic))
+            subs[topic] = sub
+        log.info(f"[ee preflight] --ee {ee}: waiting up to {timeout_s}s for "
+                 f"{', '.join(spec['topics'])}")
+
+        deadline = time.monotonic() + timeout_s
+        last_warning = 0.0
+        while True:
+            if len(seen) == len(spec["topics"]):
+                break
+            if time.monotonic() >= deadline:
+                missing = [t for t in spec["topics"] if t not in seen]
+                raise ee_state_timeout_error(ee, timeout_s, missing, spec)
+            if time.monotonic() - last_warning >= 1.0:
+                last_warning = time.monotonic()
+                log.warning(f"[ee preflight] waiting for {ee} state... "
+                            f"({deadline - time.monotonic():.0f}s left, "
+                            f"seen {len(seen)}/{len(spec['topics'])})")
+            time.sleep(0.01)
+
+        log.info(f"[ee preflight] OK: --ee {ee} answering on "
+                 f"{', '.join(sorted(seen))}")
+        return set(seen)
+    finally:
+        # Same discipline as preflight(): the controller creates its own readers a
+        # moment later, and a leaked reader would sit on the topic for the process's
+        # lifetime.
+        for topic, sub in subs.items():
+            try:
+                sub.Close()
+            except Exception as exc:
+                log.warning(f"[ee preflight] closing {topic} subscriber: {exc}")
+        gc.collect()
+
+
 def make_hand_cmd(n_joints=NUM_JOINTS_EXPECTED, gains=None, thumb_base_index=THUMB_BASE_INDEX):
     """Build a HandCmd_ sized for n_joints, in position-control mode, zeroed.
 

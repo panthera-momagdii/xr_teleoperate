@@ -31,6 +31,27 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
     publisher.Write(msg)
     logger_mp.info(f"published reset category: {category}")
 
+# [panthera] Exit codes. 0 clean, 1 an exception got out, 2 argparse (its own default).
+# Everything above 2 is a pre-flight refusal that a script can act on without parsing
+# log text. Keep these stable -- RUNBOOK_PARTB.md documents them.
+EXIT_NO_EE_STATE = 3     # an --ee was given and its state topic never arrived
+EXIT_PORT_BUSY   = 4     # the XR port (8012) is already held by another process
+
+
+def notice(text):
+    """Operator-facing text, printed verbatim to stderr.
+
+    [panthera] logging_mp renders through rich, which word-wraps every message into a
+    narrow column, breaks long tokens across lines -- DDS topic names and file paths
+    come out as "rt/dex1/left/stat e" and "/home/.../cert.pe m" -- and injects the
+    source-location gutter INTO the first line of the text. That is acceptable for
+    tracing and useless for a refusal an operator has to act on at 2 a.m. on a robot
+    day, so anything that names a topic, a path or a PID goes out here unwrapped as
+    well as to the log.
+    """
+    print(text, file=sys.stderr, flush=True)
+
+
 # state transition
 START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
@@ -119,12 +140,64 @@ if __name__ == '__main__':
     if ee_model_error:
         parser.error(ee_model_error)
 
+    # [panthera] ---- static pre-flight, before ANY of this touches the robot ----------
+    #
+    # Both checks below are properties of this host, not of the robot, so they run
+    # before the try block: before ChannelFactoryInitialize, before Enter_Debug_Mode,
+    # and before the image server is contacted. A plain sys.exit() here cannot be
+    # swallowed by the finally block's own exit().
+
+    # The certificate televuer will serve. One line, always printed. A regenerated cert
+    # invalidates the Quest's stored exception, and on 2026-09-09 that cost a session:
+    # nothing named the file or its fingerprint, so the first symptom was a headset that
+    # would not connect. See tools/cert_info.py and logs/overnight/cert_evidence/.
+    try:
+        from tools.cert_info import oneline as _cert_oneline
+        _cert_line = _cert_oneline()
+        notice(_cert_line)
+        logger_mp.info(_cert_line)
+    except Exception as exc:                      # never block a session on a log line
+        logger_mp.warning(f"[cert] could not describe the certificate: {exc}")
+
+    # The XR port. Vuer binds it inside its own aiohttp startup thread, and the launcher
+    # never learns that the bind failed: on 2026-09-09 quest_link_check.py was still
+    # holding 8012, the launcher ran on with no XR data, and [r] drove the arms to
+    # televuer's fallback pose instead of following the operator. Refuse instead.
+    from tools import port_guard
+    try:
+        from vuer import Vuer as _Vuer
+        _xr_port = int(os.environ.get("XR_VUER_PORT", getattr(_Vuer, "port", 8012)))
+        _vuer_free_port = getattr(_Vuer, "free_port", None)
+    except Exception:
+        _xr_port = int(os.environ.get("XR_VUER_PORT", "8012"))
+        _vuer_free_port = None
+    if _vuer_free_port:
+        # Vuer has been told to pick any free port, so a busy 8012 is not fatal --
+        # but the headset URL will not be the one in the runbook.
+        logger_mp.warning(f"[xr] Vuer.free_port={_vuer_free_port} is set; skipping the "
+                          f"port {_xr_port} check. The headset URL will NOT be :{_xr_port}.")
+    elif not port_guard.port_is_free(_xr_port):
+        _busy = port_guard.describe_busy(_xr_port)
+        notice(f"[xr] REFUSING TO START (exit {EXIT_PORT_BUSY})\n{_busy}\n"
+               f"    vuer needs {_xr_port} and cannot have it. Running on would give a\n"
+               f"    dead XR path, and [r] would move the arms to a default pose with\n"
+               f"    nothing to follow.")
+        logger_mp.error(_busy)
+        sys.exit(EXIT_PORT_BUSY)
+    else:
+        notice(f"[xr] port {_xr_port} is free")
+        logger_mp.info(f"[xr] port {_xr_port} is free")
+
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
     # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:
     # name 'arm_ctrl' is not defined", which reads like a second, unrelated fault.
     arm_ctrl = None
     had_exception = False        # [panthera] see the except/finally at the bottom
+    # [panthera] An explicit override for the exit status. SystemExit raised inside the
+    # try block reaches `finally`, whose own exit() would otherwise replace the code
+    # with 0/1 and throw away which pre-flight refused.
+    exit_code = None
 
     try:
         # setup dds communication domains id
@@ -146,8 +219,29 @@ if __name__ == '__main__':
         # replacement. preflight() closes its subscribers before returning.
         # dex5 is the parked lane; inspire_ftp is the hand actually fitted. Both refuse
         # here rather than after the release.
-        if args.ee in ("dex5", "inspire_ftp"):
-            hand_config.preflight(log=logger_mp)
+        #
+        # [panthera] Every OTHER --ee family gets a bounded check too, from the same
+        # place. Their controllers all wait for a state topic in an unbounded loop
+        # (hand_config.EE_STATE_TOPICS lists them with line numbers), so before this
+        # `--ee dex1` on a robot with no Dex1 hung forever printing "Waiting to
+        # subscribe dds..." at 100 Hz. Now it refuses in XR_HAND_WAIT_S and exits 3.
+        #
+        # --ee stays OPTIONAL: with no --ee nothing here runs, and arms-only
+        # teleoperation is unaffected.
+        if args.ee is not None:
+            _ee_wait_s = float(os.environ.get("XR_HAND_WAIT_S", "10"))
+            try:
+                if args.ee in ("dex5", "inspire_ftp"):
+                    hand_config.preflight(timeout_s=_ee_wait_s, log=logger_mp)
+                else:
+                    hand_config.ee_state_preflight(args.ee, timeout_s=_ee_wait_s,
+                                                   log=logger_mp)
+            except RuntimeError as exc:
+                notice(f"[ee] REFUSING TO START (exit {EXIT_NO_EE_STATE})\n"
+                       f"    {exc}")
+                logger_mp.error(str(exc))
+                exit_code = EXIT_NO_EE_STATE
+                raise SystemExit(EXIT_NO_EE_STATE)
 
         # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
@@ -325,14 +419,22 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless)
 
-        logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
-        if args.record:
-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
-        else:
-            logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
-        logger_mp.info("🔴  Press [q] to stop and exit the program.")
-        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        # [panthera] The key prompt goes through notice() as well as the log. rich wraps
+        # the logged copy and injects its source-location gutter mid-sentence, so
+        # "Press [r] to start syncing..." arrives split across three lines with
+        # "teleop_hand_and_arm.py:NNN" in the middle of it. This is the one banner an
+        # operator must not miss, and the one line a script waits for.
+        _banner = [
+            "----------------------------------------------------------------",
+            "🟢  Press [r] to start syncing the robot with your movements.",
+            ("🟡  Press [s] to START or SAVE recording (toggle cycle)." if args.record
+             else "🔵  Recording is DISABLED (run with --record to enable)."),
+            "🔴  Press [q] to stop and exit the program.",
+            "⚠️  IMPORTANT: Please keep your distance and stay safe.",
+        ]
+        notice("\n".join(_banner))
+        for _line in _banner:
+            logger_mp.info(_line)
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
@@ -654,4 +756,6 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
         logger_mp.info("✅ Finally, exiting program.")
-        exit(1 if had_exception else 0)
+        # [panthera] exit_code wins when a pre-flight refused, so the caller learns
+        # WHICH check failed (3 = no ee state, 4 = port busy) instead of a flat 1.
+        exit(exit_code if exit_code is not None else (1 if had_exception else 0))
