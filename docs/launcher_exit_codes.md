@@ -48,6 +48,8 @@ times on 2026-09-09 (hanging robot, development mode, velocity limit 3 and 5 rad
 | `6` | **SIGTERM** (RT4) | the same orderly stop as `q`. |
 | `7` | **start gate (RT6f): an arm joint is within `XR_GATE_LIMIT_MARGIN` (default 0.05 rad) of a URDF limit** | the refusal names each joint, its angle, the limit and the distance. Checked right after DDS init, before debug mode and before the arm controller, so nothing was commanded and the pose was not recorded as the rest pose. The arms were probably moved by hand: someone at the robot moves them clear, then start again. |
 
+| `8` | **follow guard stop (G0): tracking error or a joint at its stop** while following: max \|IK target - measured\| over `XR_TRACK_ERR_MAX` (default 0.35 rad) for longer than `XR_TRACK_GRACE_S` (default 1.0 s), or a joint within `XR_JOINT_STOP_MARGIN` (0.02 rad) of its URDF limit while its target is `XR_JOINT_STOP_GAP` (0.2 rad) inside | the `[follow] STOP:` line names the joint, target and measured angle. The controller held the measured pose, then the session ended with the normal lowering and release. Look at why the arm did not follow (obstacle, cable, a pose the motors cannot hold) before the next run. |
+
 These are stable; scripts may depend on them.
 
 **Start gate warning (RT6f, not an exit):** with `XR_LAST_POSE_FILE` set, the launcher saves the

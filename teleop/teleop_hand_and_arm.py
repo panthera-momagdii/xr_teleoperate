@@ -31,6 +31,7 @@ from teleop.robot_control import link_guard as link_guard_mod
 from teleop.robot_control import torque_cap as torque_cap_mod
 from teleop.robot_control import start_gate as start_gate_mod
 from teleop.robot_control import ik_worker as ik_worker_mod
+from teleop.robot_control import follow_guard as follow_guard_mod
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -54,6 +55,7 @@ EXIT_PORT_BUSY   = 4     # the XR port (8012) is already held by another process
 EXIT_HANGUP      = 5     # [RT4] SIGHUP: the operator's terminal went away; orderly stop as [q]
 EXIT_TERMINATED  = 6     # [RT4] SIGTERM: asked to stop; orderly stop as [q]
 EXIT_START_GATE  = 7     # [RT6f] an arm joint within XR_GATE_LIMIT_MARGIN of a limit at start
+EXIT_FOLLOW_STOP = 8     # [G0] the follow guard stopped (tracking error or a joint at its stop)
 
 
 def notice(text):
@@ -417,6 +419,13 @@ if __name__ == '__main__':
     except torque_cap_mod.TorqueCapError as exc:
         parser.error(str(exc))
 
+    # [G0] Follow guard knobs (XR_TRACK_ERR_MAX, XR_TRACK_GRACE_S, XR_JOINT_STOP_MARGIN,
+    # XR_JOINT_STOP_GAP), checked before any DDS; the arm controller builds the guard.
+    try:
+        follow_guard_mod.settings_from_env()
+    except follow_guard_mod.FollowGuardError as exc:
+        parser.error(str(exc))
+
     # [RT6f] Arm start gate knobs (XR_GATE_LIMIT_MARGIN, XR_GATE_MOVED_TOL, XR_LAST_POSE_FILE,
     # XR_GATE_WAIT_S). The gate itself runs right after DDS init, before Enter_Debug_Mode.
     try:
@@ -617,6 +626,9 @@ if __name__ == '__main__':
             # failure path that returns the measured pose).
             _ik_lo, _ik_hi = getattr(arm_ik, "ik_lower", None), getattr(arm_ik, "ik_upper", None)
             _ik_gfn = torque_cap_mod.gravity_fn_for(arm_ik.reduced_robot.model)
+            # [G0] The arm controller's own gravity model (its own pinocchio data: it runs in
+            # the 250 Hz thread) for the feed-forward at the MEASURED pose.
+            _ctrl_gfn = torque_cap_mod.gravity_fn_for(arm_ik.reduced_robot.model)
             _mg_line = (f"[ik] every arm joint kept {getattr(arm_ik, 'joint_margin', 0.0):g} rad inside its "
                         f"limit after the IK (XR_IK_JOINT_MARGIN)")
             notice(_mg_line)
@@ -634,7 +646,8 @@ if __name__ == '__main__':
                                                               dual_gripper_action_array, motion_mode=args.motion, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
             else:
                 try:
-                    arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                    arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim,
+                                                   gravity_fn=_ctrl_gfn)
                     _ARM_REF[0] = arm_ctrl
                     if os.environ.get("XR_RELEASE_FILE"):
                         notice(f"[lower] release at once (zero torque) on chatter: watching "
@@ -676,6 +689,10 @@ if __name__ == '__main__':
         else:
             logger_mp.warning(f"[arm] {type(arm_ctrl).__name__} has no set_arm_velocity_limit; "
                               f"XR_ARM_VEL_LIMIT={arm_velocity_limit} NOT applied")
+        # [G0] The runaway fix: how the controller follows, and when it stops.
+        if hasattr(arm_ctrl, "describe_follow"):
+            notice(arm_ctrl.describe_follow())
+            logger_mp.info(arm_ctrl.describe_follow())
 
         # [panthera] Now that the IK model exists, re-check the start pose against the
         # REAL URDF joint limits. The early parse could not do this without building the
@@ -914,6 +931,7 @@ if __name__ == '__main__':
                                   + ",".join(f"meas_{i}" for i in range(15, 29)) + "\n")
             except OSError:
                 _tlog["fh"] = None
+        _follow_stop_seen = False     # [G0]
         while not STOP:
             start_time = time.time()
             # get image
@@ -1053,6 +1071,17 @@ if __name__ == '__main__':
             cmd_q, cmd_tauff = link_guard.step(time.monotonic(), cmd_q, cmd_tauff,
                                                dt=1.0 / args.frequency)
             arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tauff)
+            # [G0] The follow guard stopped (tracking error against the IK target, or a joint
+            # at its stop): the controller holds the measured pose; end the session, which
+            # lowers and releases the arms.
+            _ff = getattr(arm_ctrl, "follow_fault", None)
+            if _ff and not _follow_stop_seen:
+                _follow_stop_seen = True
+                notice(f"[follow] STOP: {_ff}. Holding the measured pose; lowering and releasing "
+                       f"(exit {EXIT_FOLLOW_STOP})")
+                exit_code = EXIT_FOLLOW_STOP
+                START = False
+                STOP = True
             # [RT7] Per loop: the IK target given to the controller (before its speed limiter),
             # the raw IK solution and the measured arm q, to XR_TARGET_LOG (CSV). Logging only.
             if _tlog["fh"] is not None:

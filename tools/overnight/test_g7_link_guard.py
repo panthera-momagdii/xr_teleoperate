@@ -169,9 +169,12 @@ def ipc_send(cmd, timeout_ms=4000):
 # XR_SHOULDER_TAU_CAP=0: the RT6d shoulder torque cap is off here. The fake headset's wrists
 # sit about 8 Nm out front, so with the cap on the "operator moved during the outage" jump is
 # held at the 4 Nm limit and there is nothing to blend (that path is test_g10's job).
+# [G0] XR_TRACK_ERR_MAX=10: the follow guard's tracking stop is out of reach here. This
+# fake's arms never move (constant q = 0), so against the moving headset the guard stops
+# the session after 1 s, before any HOLD (that path is test_g18's job).
 LAUNCH_ENV = {"XR_ARM_VEL_LIMIT": str(VEL), "XR_STALE_S": str(STALE_S),
               "XR_REENGAGE_T": str(REENGAGE_T), "XR_HAND_WAIT_S": "15",
-              "PYTHONUNBUFFERED": "1", "XR_SHOULDER_TAU_CAP": "0"}
+              "PYTHONUNBUFFERED": "1", "XR_SHOULDER_TAU_CAP": "0", "XR_TRACK_ERR_MAX": "10"}
 LAUNCH_ARGS = ["teleop_hand_and_arm.py", "--sim", "--network-interface", "lo",
                "--ee", "inspire_ftp"]
 

@@ -78,7 +78,7 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, gravity_fn = None):
         logger_mp.info("Initialize G1_29_ArmController...")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
@@ -176,6 +176,12 @@ class G1_29_ArmController:
         self._t_started = time.time()
         self._release_poll = 0
 
+        # [G0] Hold the measured start pose until the launcher sends a target. q_target was
+        # zeros: the old clip crept towards q = 0 0.004 rad at a time, the follow step would
+        # walk there at the speed limit. Then follow through the follow guard (runaway fix).
+        self.q_target = self.q_rest.copy()
+        self._init_follow(gravity_fn)
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -197,7 +203,59 @@ class G1_29_ArmController:
                 self.lowstate_sub_ready = True
             time.sleep(0.002)
 
+    def _init_follow(self, gravity_fn):
+        """[G0] The follow guard (teleop/robot_control/follow_guard.py), seeded at the
+        measured pose; its stops are armed by the first ctrl_dual_arm()."""
+        from teleop.robot_control import follow_guard as fg
+        from teleop.robot_control.start_gate import urdf_arm_limits
+        try:
+            lo, hi = urdf_arm_limits()
+        except Exception as e:
+            logger_mp.error(f"[follow] no URDF joint limits ({e}): joint-at-stop stop off")
+            lo = hi = None
+        self._follow = fg.FollowGuard(self.arm_velocity_limit, self.control_dt, gravity_fn=gravity_fn,
+                                      lower=lo, upper=hi, **fg.settings_from_env())
+        self._following = False
+        self._follow_fault_logged = False
+        self._follow.reset(self.get_current_dual_arm_q())
+        if gravity_fn is None:
+            logger_mp.warning("[follow] no gravity model: no feed-forward is sent while following")
+
+    def _follow_step(self, arm_q_target, arm_tauff_target, t=None):
+        """[G0] One control step while following: the command rate-limited from the LAST
+        COMMAND (never from the measured pose), gravity feed-forward at the MEASURED pose
+        (arm_tauff_target, the launcher's feed-forward for the target pose, is not sent:
+        that pair ran the arms into their stops in RT7), the tracking-error and
+        joint-at-stop stops. Returns (q, tau)."""
+        q_cmd, tau = self._follow.step(time.monotonic() if t is None else t, arm_q_target,
+                                       self.get_current_dual_arm_q(), armed=self._following)
+        st = self._clip_stats
+        st[0] += 1
+        if self._follow.clipped:
+            st[1] += 1
+            st[2] += int(self._follow.clipped_arms[0])
+            st[3] += int(self._follow.clipped_arms[1])
+        if self._follow.fault is not None and not self._follow_fault_logged:
+            self._follow_fault_logged = True
+            logger_mp.error(f"[G1_29_ArmController] FOLLOW STOP: {self._follow.fault}; holding the measured pose")
+        return q_cmd, tau
+
+    @property
+    def follow_fault(self):
+        """[G0] Why the follow guard stopped (latched), or None."""
+        f = getattr(self, "_follow", None)
+        return None if f is None else f.fault
+
+    def describe_follow(self):
+        return self._follow.describe()
+
+    def read_follow_err(self):
+        """[G0] Max |IK target - measured| (rad) since the last call."""
+        return self._follow.read_stats()
+
     def clip_arm_q_target(self, target_q, velocity_limit):
+        # [G0] No longer used while following (see _follow_step): anchored to the measured
+        # pose, it let the 23 Oct runaway happen. Kept for its callers and tests.
         current_q = self.get_current_dual_arm_q()
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
@@ -269,7 +327,7 @@ class G1_29_ArmController:
             elif self.simulation_mode and not self._sim_clip:
                 cliped_arm_q_target = arm_q_target
             else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                cliped_arm_q_target, arm_tauff_target = self._follow_step(arm_q_target, arm_tauff_target)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
@@ -313,25 +371,26 @@ class G1_29_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+            self._following = True       # [G0] arms the follow guard's stops
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
         if self.mode_machine is None:
             raise RuntimeError("G1 low state is not ready.")
         return self.mode_machine
-    
+
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointIndex])
-    
+
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointArmIndex])
-    
+
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
-    
+
     LOWER_ARM_IDX = (0, 1, 2, 3, 7, 8, 9, 10)     # shoulders and elbows, both arms
     LOWER_WRIST_IDX = (4, 5, 6, 11, 12, 13)       # wrist roll, pitch, yaw, both arms
 
@@ -568,6 +627,9 @@ class G1_29_ArmController:
         current_attempts = 0
         with self.ctrl_lock:
             self.q_target = np.zeros(14)
+            # [G0] A planned move to q = 0 at the speed limit: its error against that far
+            # target is the plan, not a tracking fault. Stops disarmed for go-home.
+            self._following = False
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
@@ -588,6 +650,8 @@ class G1_29_ArmController:
         if not np.isfinite(velocity_limit) or velocity_limit <= 0.0:
             raise ValueError("arm_velocity_limit must be a positive finite value.")
         self.arm_velocity_limit = velocity_limit
+        if getattr(self, "_follow", None) is not None:      # [G0]
+            self._follow.set_velocity_limit(velocity_limit)
 
     def _Is_weak_motor(self, motor_index):
         weak_motors = [
@@ -605,7 +669,7 @@ class G1_29_ArmController:
             G1_29_JointIndex.kRightElbow.value,
         ]
         return motor_index.value in weak_motors
-    
+
     def _Is_wrist_motor(self, motor_index):
         wrist_motors = [
             G1_29_JointIndex.kLeftWristRoll.value,
