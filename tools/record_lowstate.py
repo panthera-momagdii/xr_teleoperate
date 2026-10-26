@@ -5,8 +5,8 @@ Subscribes to rt/lowstate and to both Inspire hand state topics, and writes one 
 per lowstate message to a compressed .npz. Built for Part B takes: reach_sweep,
 writing, tray_empty, tray_loaded, marker.
 
-    python tools/record_lowstate.py --label reach_sweep
-    python tools/record_lowstate.py --label smoke --seconds 20
+    python tools/record_lowstate.py --label reach_sweep --domain 0 --iface eth0
+    python tools/record_lowstate.py --label smoke --seconds 20 --domain 1 --iface lo
 
 Read-only by construction: this tool creates readers only. The gate check greps this
 file for the SDK's writer class name and must find nothing, which is why that name is
@@ -261,9 +261,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--label", required=True,
                         help="take name, e.g. reach_sweep / writing / tray_loaded")
-    parser.add_argument("--domain", type=int, default=0, help="DDS domain (default 0)")
-    parser.add_argument("--iface", type=str, default="enP7s7",
-                        help="network interface (default enP7s7)")
+    # [RT4] No defaults: they were domain 0 and enP7s7, the Spark's NIC. On PC2 a bare
+    # run would have joined the robot's domain on the wrong interface. Say both.
+    parser.add_argument("--domain", type=int, required=True,
+                        help="DDS domain: 0 = the robot (read-only here), 1 = the fakes")
+    parser.add_argument("--iface", type=str, required=True,
+                        help="network interface, e.g. eth0 on PC2, lo for the fakes")
     parser.add_argument("--seconds", type=float, default=0.0,
                         help="stop after N s (default 0 = run until Ctrl+C)")
     parser.add_argument("--out-dir", type=str,
@@ -279,6 +282,10 @@ def main():
     utc = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     out_path = os.path.join(args.out_dir, f"{label}_{utc}.npz")
 
+    # [RT4] setup_tool_logger() creates logs/ but not logs/partb/, so a fresh logs dir
+    # crashed here with FileNotFoundError (RT1, 13 Oct 2026).
+    from tools.tool_logging import LOG_DIR as _LOG_DIR
+    os.makedirs(os.path.join(_LOG_DIR, "partb"), exist_ok=True)
     log = setup_tool_logger("record_lowstate",
                             filename=os.path.join("partb", f"{label}_{utc}.log"))
     log.info("READ-ONLY. This tool creates readers only.")

@@ -39,17 +39,17 @@ hand_model:
   serial_numbers:
     right:
       status: measured
-      value: "411AA1A04140021"
+      value: "<local: hand_right_serial>"
     left:
       status: measured_partial
-      value: "401AA1A0416??01"
+      value: "<local: hand_left_serial_partial>"
       confidence: >
         Read from Brandon's photo of the left wrist ring. Two characters (positions 12-13,
         shown as ??) are not legible in the image; they are most likely "01". Treat the
         full string as UNCONFIRMED until someone reads the ring directly -- it is an
         identity field, and a serial that is 90% right is not a serial.
       note: >
-        The left prefix reads 401..., the right 411... -- they differ in the third
+        The left and right prefixes differ in the third
         character. That is expected to be a per-unit serial, not a typo, but it is
         another reason not to infer the missing characters from the right hand's SN.
   power_led:
@@ -76,22 +76,43 @@ hand_transport:
   status: measured
   value: "Modbus TCP over Ethernet, from PC2"
   hosts:
-    left_or_right_unassigned: ["192.168.123.210", "192.168.123.211"]
-    note: >
-      Which address is which hand is UNKNOWN and stays unknown until it is read, not
-      guessed. Do not infer it from .210 < .211 or from the MAC ordering.
-    how_to_resolve_without_moving_anything: >
-      Read state from one address and compare it with the physical hand -- e.g. a finger
-      held closed by hand shows in that address's angle registers. Reading is a session
-      on the hand but moves nothing. Assigning left/right wrongly and then commanding is
-      how a hand gets driven into the wrong limits.
+    status: measured                       # 2026-09-01, visit 2 gate V4
+    left:  "<hand_left_ip>"
+    right: "<hand_right_ip>"
+    measured_how: >
+      Ethernet unplug on the LEFT physical hand while the bridge was running. The bridge's
+      Modbus error path names the failing IP directly, which is stronger evidence than a
+      DDS-staleness inference.
+    evidence_line: >
+      "Connection to (<hand_left_ip>, 6000) failed: timed out" /
+      "[19:32:38] <hand_left_ip>: 5791 reads, 9.1 Hz, 11 err   <hand_right_ip>: 5802 reads, 9.1 Hz, 0 err"
+      -- <hand_left_ip> froze at 5791 reads and began erroring the instant the LEFT cable came out,
+      while <hand_right_ip> continued at 0 errors. <hand_left_ip> was simultaneously unreachable by ping (3/3 lost).
+    confirms: >
+      The provisional mapping (<hand_left_ip> -> l, <hand_right_ip> -> r) was correct, and it is now measured
+      rather than assumed. This also settles the upstream contradiction in favour of
+      example/Headless_driver_double.py.
+    upstream_bug: >
+      inspire_hand_sdk/example/Headless_driver_l.py:11 is WRONG -- it maps
+      <hand_right_ip> -> LR='l'. Anyone copying that example gets left and right swapped.
+    methods_that_do_NOT_work:
+      finger_flex: >
+        IMPOSSIBLE, not merely unsuccessful. RH56 uses worm-gear actuators, which are
+        non-backdrivable: a human cannot move a DOF to produce a readable angle delta.
+        Measured peak |delta| <= 1 angle unit on all 12 DOF while a finger was pushed.
+        docs/next_visit_pc2.md must not describe the flex method.
+      palm_warming: >
+        INCONCLUSIVE. The temperature register quantises to 2 C (every reading on both
+        hands is even), and after ~90 min of polling the hands sit at ~40 C -- warmer than
+        a ~34 C palm. A ~6 C differential in the wrong direction through the shell cannot
+        clear one quantum. Both sides jittered +/-2 with no trend over 240 s.
   evidence:
-    ping_210: "2/2 received, rtt avg 0.350 ms, dev eth0"
-    ping_211: "2/2 received, rtt avg 0.248 ms, dev eth0"
-    mac_210: "de:08:c0:a8:7b:d2"
-    mac_211: "de:08:c0:a8:7b:d3"
+    ping_left: "2/2 received, rtt avg 0.350 ms, dev eth0"
+    ping_right: "2/2 received, rtt avg 0.248 ms, dev eth0"
+    mac_left: "<local: hand_left_mac>"
+    mac_right: "<local: hand_right_mac>"
     mac_note: >
-      c0:a8:7b:d2 is 192.168.123.210 written in hex, and the de: prefix is
+      the MAC's last four bytes are the hand IP written in hex, and the de: prefix is
       locally administered -- an embedded Ethernet module deriving its MAC from its
       configured IP. There is therefore NO vendor OUI to identify these by.
   serial_path_absent:
@@ -189,37 +210,56 @@ domain0:
             unitreeWebRTCClientMaster, videohub_pc4, vui_service, xfkTon]
   writers_by_host:
     status: measured
-    value: {"192.168.123.161": 89, "192.168.123.164": 2}
+    value: {"<pc1_lan_ip>": 89, "<pc2_lan_ip>": 2}
     note: >
       Both PC2 writers are the STOCK videohub_pc4 service (rt/api/videohub/response,
       rt/frontvideostream). Neither is a command topic. Zero command-topic writers
       from any host but PC1.
 
-  RATE_CAVEAT: >
-    Every Hz below is a FLOOR, not a measurement. tools/domain0_census.py derives rate
-    from its own dequeued sample count, so a reader that cannot keep up under-reports
-    with no signal. Two tells: rt/lowcmd (666.5) and rt/lowstate (660.4) land within 1%
-    of each other despite being independent streams from different PC1 processes -- the
-    signature of a consumer-side ceiling -- and the 2026-08-24 tick-derived figure for
-    rt/lowstate was 999.6 Hz, ~1.5x higher. Measured with our containers down
-    (load 1.57, GPU 0), so it is not our own contention.
-    Fix tracked in logs/g14_census_bugs.md item (c).
+  RATE_CAVEAT:
+    status: SUPERSEDED 2026-09-01
+    was: >
+      Every Hz was a FLOOR, because tools/domain0_census.py derived rate from its own
+      dequeued sample count. rt/lowcmd (666.5) and rt/lowstate (660.4) agreeing to ~1%
+      across independent streams was the tell.
+    now: >
+      Fixed on branch (commit ed7a36f, gate G14e). Rate is now 1 / p10(source_timestamp
+      deltas) -- the publisher's own send times, independent of how fast the reader
+      dequeues -- with median as a drop indicator and an explicit DROPPING flag when the
+      reader falls behind. The numbers below are from the fixed estimator and are
+      measurements, not floors.
 
   lowstate:
-    status: measured
+    status: measured                        # re-measured 2026-09-01 with the fixed estimator
     writers: 2
-    per_writer_hz: {"...4b5fbae8:203": 660.4, "...6f5f3a66:203": 0.0}
-    aggregate_hz_floor: 660.4
-    tick_derived_hz_2026_08_24: 999.6
+    per_writer:
+      "...2ee8-42d5:203": {rate_hz: 1157.9, median_hz: 1003.4, seen_hz: 625.9, samples: 6493, dropping: true}
+      "...2a38-50ec:203": {rate_hz: 0.0, samples: 0}
+    TICKS_PER_SAMPLE:
+      status: measured
+      value: 0.960
+      answers: >
+        The 2026-08-24 question. LowState_.tick is a PER-PUBLISH counter, incrementing
+        ~once per published sample -- not a millisecond clock. So the Aug-24 method
+        (counting unique ticks) was measuring publish rate correctly, and its 999.6 Hz
+        figure was right while the sample-count figure (660.4 Hz) was the artefact.
+      note: >
+        The census reports 600.8 ticks/s, but that is computed over the samples this
+        reader actually saw while DROPPING; scaled by the true rate it is ~1110 ticks/s.
+        The ratio 0.960 is the meaningful number, not the absolute ticks/s.
+    true_rate_hz: 1157.9
     type: "unitree_hg::msg::dds_::LowState_"
   lowcmd:
     status: measured
     writers: 2
-    per_writer_hz: {"...fc552420:1403": 666.5, "...33011e6c:e03": 0.0}
+    per_writer:
+      "...5e1a-3647:1403": {rate_hz: 1062.8, median_hz: 1000.5, seen_hz: 645.7, samples: 7112, dropping: true}
+      "...fd8d-d86e:e03": {rate_hz: 0.0, samples: 0}
+    remeasured_2026_09_01: "1062.8 Hz on the carrying writer, with the fixed estimator"
     split_note: >
       H3 answered: this is NOT a ~500/133 split. ONE writer carries the entire stream
       and the other is idle at 0.0 Hz. Same shape on rt/lowstate.
-    source_verified: "both udp/192.168.123.161 (PC1), from the SEDP trace"
+    source_verified: "both udp/<pc1_lan_ip> (PC1), from the SEDP trace"
     type: "unitree_hg::msg::dds_::LowCmd_"
   arm_sdk:
     status: measured
@@ -229,6 +269,134 @@ domain0:
   type_agreement:
     status: measured
     value: "all writers agree on every watched topic; all unitree_hg"
+
+# =====================================================================
+# BRIDGE + HAND STATE -- measured 2026-09-01 (visit 2)
+# =====================================================================
+bridge:
+  status: measured
+  repo: "panthera-momagdii/inspire_hand_ws"
+  branch: "panthera/pc2-headless"
+  sha: "3804d41d4794ca895cd281d16bbba38a319a958d"
+  install:
+    method: "pip install ./inspire_hand_sdk --no-deps   (NON-editable)"
+    why_no_deps: >
+      The package pins cyclonedds==0.10.2 and PC2's unitree_sdk2py depends on cyclonedds
+      too. Verified on PC2: cyclonedds was 0.10.2 before AND after the install.
+    pymodbus: "3.6.9"
+    headless_proof: "import PyQt5 -> ModuleNotFoundError; the Qt stack is not pulled in"
+    env: "conda g1visit, Python 3.10.21"
+  runner:
+    path: "~/panthera/bridge_run.py + ~/panthera/bridge_config.yaml"
+    workarounds:
+      network_param_ignored: >
+        ModbusDataHandler(network=...) is silently dropped (inverted branch,
+        inspire_sdk.py:77-81). The runner calls ChannelFactoryInitialize(0, "eth0")
+        itself, once, and passes initDDS=False to every handler.
+      swallowed_dds_failure: >
+        A DDS init failure inside __init__ returns before self.pub/state_pub/sub exist and
+        surfaces later as AttributeError: no attribute 'pub'. The runner asserts all three
+        attributes after construction so the real cause is named at startup.
+  STARTUP_WRITE:
+    status: measured
+    finding: >
+      ModbusDataHandler.__init__ performs one Modbus WRITE before any DDS endpoint exists:
+      inspire_sdk.py:87  self.client.write_register(1004,1,self.device_id)  #reser error
+      Register 1004 = CLEAR_ERROR, established in-repo: example/init_set_inspire_hand.py
+      documents 1005 SAVE / 1006 RESET_PARA / 1009 GESTURE_FORCE_CLB and names the method
+      that writes 1004 clean_error(). It is NOT a motion register (1486/1474/1498/1522).
+    read_loop: "clean -- read() only does read_holding_registers plus DDS publishes"
+    mitigation: >
+      bridge_run.py --read-only-start suppresses just the 1004 write, making startup
+      strictly read-only. Used for both starts on 2026-09-01.
+    outcome: >
+      err = 0 on all 12 DOF at both starts, so there was no latched error to clear. The
+      read-only start cost nothing and let us OBSERVE that rather than clearing it blind.
+  stability:
+    status: measured
+    session_1: "63,447 reads per hand in 6459 s (1 h 48 m) at 9.8 Hz, ZERO errors on both"
+    retires: >
+      The V0 ICMP packet-loss concern (both hands drop 4-6% of pings). It predicted nothing
+      about Modbus TCP, exactly as the fork's README said it would not.
+  cable_recovery:
+    status: measured
+    value: "pymodbus re-establishes the session by itself after a cable interruption"
+    evidence: "errors froze at 54 and the read count resumed climbing; no bridge restart needed"
+    note: "A cable interruption on one hand does not disturb the other hand."
+  dds:
+    topics_published: ["rt/inspire_hand/state/l", "rt/inspire_hand/state/r",
+                       "rt/inspire_hand/touch/l", "rt/inspire_hand/touch/r"]
+    topic_subscribed: ["rt/inspire_hand/ctrl/l", "rt/inspire_hand/ctrl/r"]
+    ctrl_never_exercised_2026_09_01: true
+    state_rate_hz: {left: 11.7, right: 12.3, note: "p10-of-source-timestamp estimator; bridge read loop runs ~9.6-9.8 Hz"}
+    writer_ip: "<pc2_lan_ip> (PC2, our bridge) -- confirmed by the census"
+
+hand_state_at_rest:
+  status: measured
+  captured: "2026-09-01, after a battery swap, hands unpowered then repowered"
+  n_dof_per_hand: 6
+  left_210:
+    angle_act:   [1, 1, 0, 5, 19, 990]
+    force_act:   [137, 124, 45, 1162, 249, -119]
+    current:     [0, 0, 0, 0, 0, 0]
+    err:         [0, 0, 0, 0, 0, 0]
+    status:      [255, 255, 255, 255, 255, 255]
+    temperature: [42, 40, 40, 40, 40, 34]
+  right_211:
+    angle_act:   [10, 27, 49, 44, 23, 987]
+    force_act:   [104, 92, 76, 106, -45, 72]
+    current:     [0, 0, 0, 0, 0, 0]
+    err:         [0, 0, 0, 0, 0, 0]
+    status:      [255, 255, 255, 255, 255, 255]
+    temperature: [44, 42, 42, 42, 42, 36]
+  POSTURE:
+    status: measured
+    value: "five of six DOF fully bent, DOF5 (thumb rotation) open at ~990"
+    confirmed_by_eye: true
+    semantics: "1000 = fully open, 0 = fully bent"
+    survives_power_cycle: true
+    what_that_proves: >
+      angle_act was unchanged across a full power-down. The hands hold position
+      MECHANICALLY (worm-gear actuators are non-backdrivable), not electrically. That
+      makes current = 0 a correct reading rather than a misread register.
+    consequence_for_part_B: >
+      The first ctrl message will drive the fingers OUT of a fully curled pose, not from
+      an open one. Size the first commanded motion accordingly.
+  REGISTER_MAP_CROSS_CHECK:
+    status: measured
+    finding: >
+      angle_act and pos_act are cleanly ANTI-CORRELATED on all 12 DOF: where angle ~0
+      (bent) pos ~1850-1930; on DOF5 where angle ~990 (open) pos ~42. Two independent
+      encodings of the same joint moving in opposite senses, consistent across both hands.
+      A misaligned register map would not produce that.
+    bears_on: >
+      The RH56DFTP register map reads correctly on these RH56E2 hands. This is the first
+      DIRECT evidence for the E2 == DFTP equivalence, which until now was only
+      distributor-asserted (see docs/inspire_rh56e2.md and README_PANTHERA.md).
+    caveat: "Read path only. Nothing was written, so the write half of the map is unverified."
+  unexplained:
+    status_field_255: >
+      status reads 255 (0xFF) on all 12 DOF, constant, on both hands, at every sample.
+      Not an error (err = 0). Not interpreted. Recorded, not chased.
+    force_dof3_left: >
+      Left force_act DOF3 read 429 before the battery swap and 1159-1162 after, with no
+      load applied and err = 0. A large single-channel shift in an at-rest baseline.
+      Matters only if Part B uses force control.
+
+arm_temperatures_idle:
+  status: measured
+  captured: "2026-09-01, robot powered on the stand, arms idle, our containers down"
+  purpose: "B2 baseline -- compare against this during Part B"
+  source: "rt/lowstate MotorState_.temperature (int16[2] per motor, hotter of the two)"
+  arms_max_c:
+    left:  {shoulder_pitch: 52, shoulder_roll: 52, shoulder_yaw: 48, elbow: 50,
+            wrist_roll: 47, wrist_pitch: 47, wrist_yaw: 54}
+    right: {shoulder_pitch: 50, shoulder_roll: 51, shoulder_yaw: 47, elbow: 49,
+            wrist_roll: 49, wrist_pitch: 47, wrist_yaw: 51}
+  hottest: "left_wrist_yaw 54 C"
+  shoulder_pitch_max_c: 52
+  legs_and_waist_max_c: 45
+  thresholds: "warn 60, stop 75 -- OURS; no Unitree-published limit was found"
 
 # =====================================================================
 # CAMERA -- measured 2026-08-28
@@ -243,11 +411,11 @@ camera:
     value: "Intel RealSense D435i"
   serial_librealsense:
     status: measured
-    value: "254522071775"
+    value: "<local: camera_serial_librealsense>"
     caveat: "Only visible via pyrealsense2, which does NOT work on this box -- see driver_path."
   serial_usb_descriptor:
     status: measured
-    value: "255323062039"
+    value: "<local: camera_serial_usb>"
     caveat: "Different number, same camera. This is what the UVC/OpenCV path sees and would match on."
   driver_path:
     status: measured
@@ -274,7 +442,7 @@ camera:
   transport:
     status: measured
     zmq: "enabled, port 55555"
-    webrtc: "disabled -- the headset cannot reach 192.168.123.x; ZMQ to the laptop carries the picture"
+    webrtc: "disabled -- the headset cannot reach the robot LAN; ZMQ to the laptop carries the picture"
 
 # =====================================================================
 # PC2 HEADROOM (H4) -- measured 2026-08-28

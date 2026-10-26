@@ -59,6 +59,10 @@ def main():
     parser.add_argument("--rate", type=float, default=100.0)
     parser.add_argument("--seconds", type=float, default=0.0, help="0 = until interrupted")
     args = parser.parse_args()
+    # [RT4] SIGTERM (run_failclosed.sh's `kill`, G7's teardown) must reap logging_mp's
+    # listener too, or it is orphaned with PPID 1.
+    from tools._procs import install_reaper
+    install_reaper()
 
     if args.domain == 0:
         parser.error("refusing to run on DDS domain 0: this is a test fixture")
@@ -101,6 +105,8 @@ def main():
     elapsed = time.monotonic() - started
     log.info(f"done: {sent} samples per side in {elapsed:.2f}s ({sent / elapsed:.1f} Hz)")
     sys.stdout.flush()
+    from tools._procs import reap_child_processes   # [RT4] os._exit skips atexit: reap logging_mp's listener
+    reap_child_processes()
     os._exit(0)
 
 

@@ -139,6 +139,10 @@ def main():
     parser.add_argument("--lag-ms", type=float, default=20.0,
                         help="lag applied to echoed q, in ms (default 20)")
     args = parser.parse_args()
+    # [RT4] SIGTERM (run_failclosed.sh's `kill`, G7's teardown) must reap logging_mp's
+    # listener too, or it is orphaned with PPID 1.
+    from tools._procs import install_reaper
+    install_reaper()
 
     log = setup_tool_logger("fake_hand_state")
     log.info("THIS IS A TEST FIXTURE. Never run it on the robot's domain.")
@@ -202,4 +206,6 @@ if __name__ == "__main__":
     # listener keeps the interpreter alive at shutdown (observed blocked in pipe_read).
     # Scripted loopback tests need this fixture to actually stop.
     logging.shutdown()
+    from tools._procs import reap_child_processes   # [RT4] os._exit skips atexit: reap logging_mp's listener
+    reap_child_processes()
     os._exit(rc)

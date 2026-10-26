@@ -154,6 +154,11 @@ action_out = Array('d', 12, lock=False)
 ctrl = Inspire_Controller_FTP(left_in, right_in, lock, state_out, action_out)
 print("CONSTRUCTED", flush=True)
 time.sleep(4.0)
+# [RT4] The controller forks its control loop, and logging_mp forks a listener;
+# os._exit() skips both their cleanups. They were left running for minutes,
+# publishing rt/inspire_hand/ctrl/* on domain 1 (RT1, 13 Oct 2026). Reap them.
+from tools._procs import reap_child_processes
+reap_child_processes()
 os._exit(0)
 ''' % str(REPO)
 
@@ -209,6 +214,13 @@ finally:
     except subprocess.TimeoutExpired:
         fake.kill()
 os.unlink(listener_path); os.unlink(harness_path)
+
+# [RT4] The harness's forked children must be gone too, not just the harness.
+time.sleep(1.0)
+_ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True).stdout
+_left = [l.strip() for l in _ps.splitlines() if harness_path in l or listener_path in l]
+record("no harness or listener process is left behind", not _left,
+       "; ".join(_left)[:200] if _left else "none")
 
 harness_out = out
 record("Inspire_Controller_FTP constructs at all", "CONSTRUCTED" in harness_out,
@@ -266,7 +278,8 @@ record("it now asserts the real wording and both topic names",
        and src.count("hand_config.TOPIC_LEFT_STATE in str(exc)") == 2)
 
 proc = subprocess.run([str(REPO / "tools/overnight/run_failclosed.sh"), "4"],
-                      capture_output=True, text=True, timeout=600)
+                      capture_output=True, text=True, timeout=600,
+                      env=dict(os.environ, PY=PY))   # [RT4] this interpreter, not the Spark's
 tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
 record("the whole fail-closed suite is green (was 4/6)",
        proc.returncode == 0 and "0 mismatch" in tail, tail)

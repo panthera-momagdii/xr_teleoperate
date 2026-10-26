@@ -7,7 +7,11 @@ TMO="${1:-4}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT/teleop" || exit 1
 export HAND_STATE_TIMEOUT_S="$TMO"
-PY=/home/mohammed/miniforge3/envs/tv/bin/python
+# [RT4] Was hard-coded to the Spark's /home/mohammed/miniforge3/envs/tv/bin/python, so on
+# PC2 not one case started (RT1, 13 Oct 2026). test_g5 passes PY=sys.executable.
+PY="${PY:-$(command -v python)}"
+[ -x "$PY" ] || { echo "run_failclosed.sh: no python at '$PY' (set PY=...)"; exit 2; }
+mkdir -p "$ROOT/logs/overnight"
 DOM="--domain 1 --iface lo"
 fails=0
 

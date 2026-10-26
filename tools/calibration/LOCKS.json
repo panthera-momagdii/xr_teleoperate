@@ -1,0 +1,13 @@
+{
+ "live_writes": "locked again after the soft scale test (Mohammed): until the next GO",
+ "below_rest": "locked: end of session g1rs_20261014_prep (Mohammed); record sweep waits for his GO on the day",
+ "press": "locked until P3 GO per run (Mohammed)",
+ "grip": "locked until P3 GO per run (Mohammed)",
+ "thumb_motion": "locked: thumbs never move in a remote session (rule 8); P3 only, Brandon watching",
+ "sweep_wide_range": "locked: record sweep per clip on Mohammed's GO",
+ "force_rezero_1009": "locked: do not write register 1009 (Mohammed)",
+ "arm_live": "locked: arm scripts are dry-run only and publish nothing (Mohammed)",
+ "release": "locked: only on Mohammed's word",
+ "hand_right": "locked: end of session g1rs_20261014_prep (Mohammed); record sweep waits for his GO on the day",
+ "scale_test": "locked until Mohammed GO"
+}

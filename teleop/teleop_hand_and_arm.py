@@ -1,7 +1,17 @@
 import time
+import numpy as np  # [RT5] session stats percentiles
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
+# [panthera] RT4. Must run before `import logging_mp`: its listener is the first child
+# this process forks. Every multiprocessing child (logging_mp's listener, televuer's
+# vuer server, the hand controllers' control loops) is then started with
+# PR_SET_PDEATHSIG=SIGKILL, so a launcher killed with SIGKILL -- which runs no finally,
+# no atexit, no handler -- cannot leave a child publishing hand commands or holding 8012.
+import os as _os, sys as _sys
+_sys.path.append(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from tools._procs import install_parent_death_signal
+install_parent_death_signal()
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
@@ -11,13 +21,16 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
-
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController, R1_A5_ArmController, R1_A7_ArmController
 from teleop.robot_control import hand_config
 from teleop.robot_control import wrist_offset
 from teleop.robot_control import start_pose as start_pose_mod
+from teleop.robot_control import link_guard as link_guard_mod
+from teleop.robot_control import torque_cap as torque_cap_mod
+from teleop.robot_control import start_gate as start_gate_mod
+from teleop.robot_control import ik_worker as ik_worker_mod
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, R1_A5_ArmIK, R1_A7_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
@@ -38,6 +51,9 @@ def publish_reset_category(category: int, publisher): # Scene Reset signal
 # log text. Keep these stable -- RUNBOOK_PARTB.md documents them.
 EXIT_NO_EE_STATE = 3     # an --ee was given and its state topic never arrived
 EXIT_PORT_BUSY   = 4     # the XR port (8012) is already held by another process
+EXIT_HANGUP      = 5     # [RT4] SIGHUP: the operator's terminal went away; orderly stop as [q]
+EXIT_TERMINATED  = 6     # [RT4] SIGTERM: asked to stop; orderly stop as [q]
+EXIT_START_GATE  = 7     # [RT6f] an arm joint within XR_GATE_LIMIT_MARGIN of a limit at start
 
 
 def notice(text):
@@ -51,7 +67,12 @@ def notice(text):
     day, so anything that names a topic, a path or a PID goes out here unwrapped as
     well as to the log.
     """
-    print(text, file=sys.stderr, flush=True)
+    # [RT4] After the operator's terminal dies, stderr can raise EIO. A log line must
+    # never be what stops the shutdown from reaching go-home and the child reaping.
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 # state transition
@@ -60,6 +81,7 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+REENGAGE       = False  # [RT4] [r] pressed while already tracking: ask the link guard to re-engage
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -72,9 +94,31 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  ==> manual: when READY is True, set RECORD_TOGGLE=True to transition.
 #  --> auto  : Auto-transition after saving data.
 
+_ARM_REF = [None]   # [RT7] the arm controller, for "a stop during the lowering = release at once"
+
+
+def _release_if_lowering(why):
+    """[RT7] Owner, 23 Oct: any stop during the lowering releases at once (zero torque)."""
+    c = _ARM_REF[0]
+    if c is not None and getattr(c, "lowering", False):
+        c.release_now(f"{why} during the lowering")
+        notice(f"[lower] {why} during the lowering: RELEASED AT ONCE (zero torque)")
+        return True
+    return False
+
+
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, REENGAGE
+    # [RT5b] One plain line per key, keyboard or IPC: in RT5 an operator's [r] and [q]
+    # never reached the launcher and nothing showed it.
+    notice(f"[key] {key} received")
+    if key == 'q' and _release_if_lowering("[q]"):
+        return
     if key == 'r':
+        # [RT4] The first [r] starts tracking. Every later [r] is the deliberate
+        # re-engage the link guard waits for after a HOLD; it does nothing in FOLLOW.
+        if START:
+            REENGAGE = True
         START = True
     elif key == 'q':
         START = False
@@ -121,6 +165,21 @@ if __name__ == '__main__':
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
 
+    # [RT5b] GIL switch interval. The IK runs in the main thread; the 250 Hz arm publisher
+    # and the DDS readers are Python threads in the same process. At Python's default
+    # 5 ms switch interval the IK waits for the GIL: inside the launcher IK p50 was
+    # 10 ms and p99 14..21 ms, against 3..4 ms in ik_smoke. Measured with a busy thread:
+    # 5 ms -> p50 5.46 / p99 10.05 ms; 0.5 ms -> p50 3.46 / p99 4.63 ms. XR_GIL_SWITCH_S.
+    # BUT inside the full launcher on an arm-following fake it did not help (0.5 ms:
+    # p50 6.04 / p99 11.22; 5 ms: p50 4.70 / p99 9.66), so the default is Python's own;
+    # set XR_GIL_SWITCH_S to experiment.
+    try:
+        _gil_s = float(os.environ.get("XR_GIL_SWITCH_S", "0"))
+        if _gil_s > 0:
+            sys.setswitchinterval(_gil_s)
+    except ValueError:
+        parser.error(f"XR_GIL_SWITCH_S={os.environ.get('XR_GIL_SWITCH_S')!r} is not a number")
+
     # [panthera] logging_mp forks a NON-DAEMON listener on the first getLogger() and
     # reaps it only from an atexit hook. Ctrl-C and `kill` do not run atexit reliably
     # here, and the orphan inherits the LISTENING SOCKET on 8012 -- so a launcher that
@@ -128,6 +187,71 @@ if __name__ == '__main__':
     # to start with exit 4. Four such orphans accumulated while this gate was being
     # written. install_reaper() covers atexit + SIGINT + SIGTERM; nothing can cover
     # SIGKILL, which is why the exit-4 message names the PID to kill.
+    # [panthera] RT4: what happens when the operator's terminal dies.
+    #
+    # The SSH session that carries the [r]/[s]/[q] keys crosses the WAN. When it dies,
+    # the kernel sends SIGHUP to the launcher's session. Python's default for SIGHUP is
+    # to die on the spot: no finally, so no go-home and no reaping, and the arm thread
+    # simply stops publishing mid-command. Defined behaviour instead:
+    #
+    #   SIGHUP  -> the same orderly stop as [q]: leave the main loop, go home at
+    #              XR_ARM_VEL_LIMIT, reap every child, exit 5 (EXIT_HANGUP).
+    #   SIGTERM -> the same, exit 6 (EXIT_TERMINATED).
+    #   SIGINT  -> the same, exit 0. Not left to KeyboardInterrupt: when the signal lands
+    #              inside CasADi's IPOPT solve, CasADi catches the KeyboardInterrupt
+    #              itself ("KeyboardInterruptException") and the main loop never sees it.
+    #              G7 caught that: 2 of 5 SIGINTs left the launcher running.
+    #
+    # On SIGHUP stdout/stderr are first moved to logs/launcher_hup_<pid>.log: writes to
+    # a hung-up terminal raise EIO, and the shutdown must not trip over its own logging.
+    # Run the launcher inside tmux on PC2 and an SSH drop never reaches it at all; the
+    # link guard then holds the arms if the headset also drops, and the operator
+    # re-attaches and presses [r] or [q].
+    #
+    # Installed BEFORE install_reaper(), which chains to it: for SIGINT and SIGTERM the
+    # reaper kills the children first and then calls this, instead of raising
+    # KeyboardInterrupt or os._exit(143).
+    import signal as _signal
+    _signal_stop = {"sig": None}
+
+    def _detach_from_terminal():
+        try:
+            _log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            _fd = os.open(os.path.join(_log_dir, f"launcher_hup_{os.getpid()}.log"),
+                          os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        except OSError:
+            _fd = os.open(os.devnull, os.O_WRONLY)
+        for _target in (1, 2):
+            try:
+                os.dup2(_fd, _target)
+            except OSError:
+                pass
+        try:
+            os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+        except OSError:
+            pass
+
+    def _orderly_stop(signum, frame):
+        global START, STOP
+        _release_if_lowering(f"signal {_signal.Signals(signum).name}")
+        first = _signal_stop["sig"] is None
+        if first:
+            _signal_stop["sig"] = signum
+            if signum == _signal.SIGHUP:
+                _detach_from_terminal()
+        START = False
+        STOP = True
+        if first:
+            _code = {_signal.SIGHUP: EXIT_HANGUP, _signal.SIGTERM: EXIT_TERMINATED}.get(signum, 0)
+            notice(f"[signal] {_signal.Signals(signum).name}: orderly stop, same as [q] "
+                   f"(go home, reap children, exit {_code})")
+
+    for _sig in (_signal.SIGHUP, _signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_sig, _orderly_stop)
+        except (ValueError, OSError):
+            pass
+
     from tools._procs import install_reaper, reap_child_processes
     install_reaper(log=logger_mp)
 
@@ -244,16 +368,93 @@ if __name__ == '__main__':
     notice(start_seq.describe())
     logger_mp.info(start_seq.describe())
 
+    # [RT6b] Exit lowering knobs, parsed and refused before any DDS like the others.
+    #   XR_LOWER_SPEED  the most any arm joint may move on the way down (rad/s, default
+    #                   0.3, never above XR_ARM_VEL_LIMIT). [RT6d] The plan is min-jerk
+    #                   peaking at 60 % of it, and a governor slows the plan above 70 %
+    #                   measured (RT6b planned AT this speed and measured 0.47 rad/s).
+    #   XR_LOWER_PROFILE minjerk (default) or linear (the RT6b plan, for comparison)
+    #   XR_RELEASE_T    gain ramp-down after the rest pose is reached (s, default 1.5)
+    #   XR_REST_POSE    optional yaml (start-pose format); default = the arm pose
+    #                   measured when the arm controller starts (the hanging pose)
+    try:
+        lower_speed = min(float(os.environ.get("XR_LOWER_SPEED", "0.3")), arm_velocity_limit)
+        release_t = float(os.environ.get("XR_RELEASE_T", "1.5"))
+        if not (lower_speed > 0 and release_t >= 0):
+            raise ValueError("XR_LOWER_SPEED must be > 0 and XR_RELEASE_T >= 0")
+        lower_profile = os.environ.get("XR_LOWER_PROFILE", "minjerk").strip().lower()
+        if lower_profile not in ("minjerk", "linear"):
+            raise ValueError(f"XR_LOWER_PROFILE={lower_profile!r}: use minjerk or linear")
+        rest_pose = (start_pose_mod.load_pose(os.environ["XR_REST_POSE"])
+                     if os.environ.get("XR_REST_POSE") else None)
+    except (ValueError, start_pose_mod.StartPoseError) as exc:
+        parser.error(f"[lower] {exc}")
+    def _kd_text():
+        _ka = float(os.environ.get('XR_LOWER_KD', '') or G1_29_ArmController.LOWER_ARM_KD)
+        _kw = float(os.environ.get('XR_LOWER_WRIST_KD', '') or G1_29_ArmController.LOWER_WRIST_KD)
+        if not _ka and not _kw:
+            return "kd as while following (no gain raised)"
+        return (f"kd {_ka:g} on shoulders and elbows" if _ka else "shoulders/elbows kd as following") + \
+               (f", {_kw:g} on wrists" if _kw else ", wrists kd as following")
+    _lw_line = (f"[lower] at exit: arms lowered to the "
+                f"{'XR_REST_POSE yaml' if rest_pose is not None else 'pose measured at start'} "
+                + (f"at {lower_speed:g} rad/s (linear, RT6b plan)" if lower_profile == "linear" else
+                   f"with no joint above {lower_speed:g} rad/s (min-jerk plan peaking at "
+                   f"{0.6 * lower_speed:.2f}, wrists at "
+                   f"{min(float(os.environ.get('XR_LOWER_WRIST_SPEED', '0.15') or 0.15), lower_speed):.2f}, "
+                   f"slowed above {0.7 * lower_speed:.2f} measured; [RT6h] command rate limited to "
+                   f"{min(float(os.environ.get('XR_LOWER_CMD_VEL', '') or G1_29_ArmController.LOWER_CMD_VEL), lower_speed):g} rad/s, "
+                   + _kd_text()
+                   + ")")
+                + f", gravity feed-forward, then gains released over {release_t:g} s")
+    notice(_lw_line)
+    logger_mp.info(_lw_line)
+
+    # [RT6d] Shoulder pitch torque cap while following (XR_SHOULDER_TAU_CAP, Nm, default
+    # 4, 0 = off). Parsed here, before any DDS; built once the IK model exists.
+    try:
+        tau_cap_limit = torque_cap_mod.limit_from_env()
+    except torque_cap_mod.TorqueCapError as exc:
+        parser.error(str(exc))
+
+    # [RT6f] Arm start gate knobs (XR_GATE_LIMIT_MARGIN, XR_GATE_MOVED_TOL, XR_LAST_POSE_FILE,
+    # XR_GATE_WAIT_S). The gate itself runs right after DDS init, before Enter_Debug_Mode.
+    try:
+        gate_margin, gate_moved_tol, last_pose_path = start_gate_mod.settings_from_env()
+        gate_wait_s = float(os.environ.get("XR_GATE_WAIT_S", "5"))
+    except ValueError as exc:
+        parser.error(f"[gate] {exc}")
+
+    # [panthera] RT4 link-loss guard. Env only (XR_STALE_S, XR_REENGAGE_T), so it is
+    # parsed and refused here, before any DDS, like the other knobs.
+    try:
+        link_guard = link_guard_mod.from_env(velocity_limit=arm_velocity_limit, notify=notice)
+    except link_guard_mod.LinkGuardError as exc:
+        parser.error(str(exc))
+    _lg_line = (f"[link] guard: HOLD after {link_guard.stale_s:g} s without a new XR pose; "
+                f"re-engage with [r], blend {link_guard.reengage_t:g} s at "
+                f"{arm_velocity_limit:g} rad/s max")
+    notice(_lg_line)
+    logger_mp.info(_lg_line)
+
     # [panthera] Defined before the try so the finally block can distinguish "the arm
     # controller was never built" from "it was built and we are shutting down". Without
     # this a pre-flight refusal ends in a spurious "Failed to ctrl_dual_arm_go_home:
     # name 'arm_ctrl' is not defined", which reads like a second, unrelated fault.
     arm_ctrl = None
+    tau_cap = None          # [RT6d] built with the G1_29 IK; other arms run uncapped
+    _ik_lo = _ik_hi = None  # [RT6g] IK joint-margin bounds (G1_29 only)
     had_exception = False        # [panthera] see the except/finally at the bottom
     # [panthera] An explicit override for the exit status. SystemExit raised inside the
     # try block reaches `finally`, whose own exit() would otherwise replace the code
     # with 0/1 and throw away which pre-flight refused.
     exit_code = None
+    # [RT6h] The IK worker process is started here, before DDS is initialized: nothing but
+    # this thread runs yet, so there is nothing to fork past. Attached to the launcher's
+    # own G1_29_ArmIK once that exists (XR_IK_WORKER=0: in-process, as before).
+    ik_worker = None
+    if args.arm == "G1_29" and ik_worker_mod.enabled_from_env():
+        ik_worker = ik_worker_mod.IKWorker(log=notice)
 
     try:
         # setup dds communication domains id
@@ -299,12 +500,57 @@ if __name__ == '__main__':
                 exit_code = EXIT_NO_EE_STATE
                 raise SystemExit(EXIT_NO_EE_STATE)
 
+        # [RT6f] Arm start gate, before Enter_Debug_Mode and before the arm controller
+        # exists: a refusal here commands nothing, and the pose is never recorded as the
+        # rest pose. See teleop/robot_control/start_gate.py.
+        if args.arm == "G1_29":
+            _g_lo, _g_hi = start_gate_mod.urdf_arm_limits()
+            _g_q = start_gate_mod.read_arm_q(timeout_s=gate_wait_s)
+            if _g_q is None:
+                notice(f"[gate] no rt/lowstate within {gate_wait_s:g} s: arms not checked "
+                       f"(the arm controller waits for it next)")
+            else:
+                _g_refuse, _g_notes = start_gate_mod.check(
+                    _g_q, _g_lo, _g_hi, gate_margin, gate_moved_tol, last_pose_path,
+                    q_start=start_seq.pose if start_seq.enabled else None,
+                    rest_pose_set=rest_pose is not None)
+                for _g_line in _g_notes:
+                    notice(_g_line)
+                    logger_mp.info(_g_line)
+                if _g_refuse:
+                    notice(_g_refuse)
+                    logger_mp.error(_g_refuse)
+                    exit_code = EXIT_START_GATE
+                    raise SystemExit(EXIT_START_GATE)
+            # Defence in depth: the controller refuses to record a rest pose near a limit --
+            # only when that measured pose IS the rest pose. With XR_REST_POSE the yaml pose
+            # is the rest pose, and it must itself be clear of the limits.
+            # [RT6e] The velocity limit applies from the controller's first command.
+            G1_29_ArmController.INIT_VEL_LIMIT = arm_velocity_limit
+            if rest_pose is None:
+                G1_29_ArmController.REST_GUARD = (_g_lo, _g_hi, gate_margin)
+            else:
+                _g_rv = start_gate_mod.limit_violations(rest_pose, _g_lo, _g_hi, gate_margin)
+                if _g_rv:
+                    _g_txt = start_gate_mod.describe_violations(_g_rv, gate_margin).replace(
+                        "arm joint(s)", "XR_REST_POSE joint(s)")
+                    notice(_g_txt)
+                    exit_code = EXIT_START_GATE
+                    raise SystemExit(EXIT_START_GATE)
+
         # ipc communication mode. client usage: see utils/ipc.py
         if args.ipc:
             ipc_server = IPC_Server(on_press=on_press,get_state=get_state)
             ipc_server.start()
         # sshkeyboard communication mode
         else:
+            # [RT5c] Keep the terminal settings, so a listener that never stops cannot
+            # leave the operator's terminal in raw mode (restored in finally).
+            try:
+                import termios as _termios
+                _tty_saved = _termios.tcgetattr(sys.stdin.fileno()) if sys.stdin.isatty() else None
+            except Exception:
+                _tty_saved = None
             listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
                                                       kwargs={"on_press": on_press, "until": None, "sequential": False,}, 
                                                       daemon=True)
@@ -316,6 +562,12 @@ if __name__ == '__main__':
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
+        # [RT5b] Headset video knobs (XR_DISPLAY_FPS, XR_JPEG_QUALITY, XR_DISPLAY_SCALE) and
+        # the closed-websocket guard. Must be installed before TeleVuerWrapper exists.
+        from teleop.utils import televuer_stream
+        _tvs_line = televuer_stream.install()
+        notice(_tvs_line)
+        logger_mp.info(_tvs_line)
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
                                      binocular=camera_config['head_camera']['binocular'],
@@ -353,11 +605,46 @@ if __name__ == '__main__':
         # arm
         if args.arm == "G1_29":
             arm_ik = G1_29_ArmIK()
+            tau_cap = torque_cap_mod.ShoulderTorqueCap(
+                tau_cap_limit, torque_cap_mod.gravity_fn_for(arm_ik.reduced_robot.model),
+                frequency=args.frequency,
+                # [RT6h] the slide and the catch-up stay inside the IK's joint bounds
+                lower=getattr(arm_ik, "ik_lower", None), upper=getattr(arm_ik, "ik_upper", None))
+            notice(tau_cap.describe())
+            logger_mp.info(tau_cap.describe())
+            # [RT6g] Joint margin after the IK: the IK's own bounds are XR_IK_JOINT_MARGIN
+            # inside the URDF limits; this clip guarantees it (IPOPT tolerance, the IK's
+            # failure path that returns the measured pose).
+            _ik_lo, _ik_hi = getattr(arm_ik, "ik_lower", None), getattr(arm_ik, "ik_upper", None)
+            _ik_gfn = torque_cap_mod.gravity_fn_for(arm_ik.reduced_robot.model)
+            _mg_line = (f"[ik] every arm joint kept {getattr(arm_ik, 'joint_margin', 0.0):g} rad inside its "
+                        f"limit after the IK (XR_IK_JOINT_MARGIN)")
+            notice(_mg_line)
+            logger_mp.info(_mg_line)
+            # [RT6h] The IK in a child process: CasADi holds the GIL for the whole solve
+            # and starved the arm controller's 250 Hz publish thread (145 to 190 Hz on the
+            # robot in RT6g). arm_ik keeps every other attribute in-process; a failed
+            # worker falls back to the in-process solve (XR_IK_WORKER=0 forces that).
+            if ik_worker is not None:
+                arm_ik = ik_worker.attach(arm_ik)
+                notice(arm_ik.describe())
+                logger_mp.info(arm_ik.describe())
             if args.ee == "dex1_internal":
                 arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, dual_gripper_state_array,
                                                               dual_gripper_action_array, motion_mode=args.motion, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
             else:
-                arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                try:
+                    arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                    _ARM_REF[0] = arm_ctrl
+                    if os.environ.get("XR_RELEASE_FILE"):
+                        notice(f"[lower] release at once (zero torque) on chatter: watching "
+                               f"{os.path.basename(os.environ['XR_RELEASE_FILE'])}; a second stop during the "
+                               f"lowering releases too")
+                except start_gate_mod.StartGateError as exc:
+                    notice(str(exc))
+                    logger_mp.error(str(exc))
+                    exit_code = EXIT_START_GATE
+                    raise SystemExit(EXIT_START_GATE)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -539,21 +826,52 @@ if __name__ == '__main__':
             "⚠️  IMPORTANT: Please keep your distance and stay safe.",
         ]
         notice("\n".join(_banner))
+        # [RT5b] Where the operator's keys must go.
+        try:
+            if os.environ.get("TMUX"):
+                import subprocess as _sp
+                # [RT5c] stdin=DEVNULL: a tmux client that inherits the tty clears
+                # O_NONBLOCK on it, which made sshkeyboard's read blocking and hung the
+                # exit after [q] (both RT5b rechecks).
+                _sess = _sp.run(["tmux", "display-message", "-p", "#S"], capture_output=True,
+                                text=True, timeout=3, stdin=_sp.DEVNULL).stdout.strip() or "?"
+                notice(f"attach check: tmux ls must show {_sess} (attached)")
+            else:
+                notice("attach check: NOT inside tmux -- run the launcher in tmux on PC2")
+        except Exception:
+            pass
         for _line in _banner:
             logger_mp.info(_line)
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            link_guard.observe(time.monotonic(), link_guard_mod.wrist_marker(tv_wrapper.tvuer))
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
 
+        # [RT6h] The arm controller's 250 Hz publish thread waits for the GIL whenever the
+        # main thread runs Python (the torque cap's search, televuer, stats). A thread
+        # holding the GIL is asked to drop it after the switch interval: 5 ms by default,
+        # more than a control step. 1 ms (XR_GIL_SWITCH_MS) bounds that wait. Set here, for
+        # the loop only: start-up (DDS, the controllers) runs at the default.
+        try:
+            sys.setswitchinterval(max(0.0002, float(os.environ.get("XR_GIL_SWITCH_MS", "1") or 1) / 1000.0))
+        except ValueError:
+            pass
         notice("--------------------- start Tracking -------------------------")
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
 
         # [panthera] Arm the start-pose sequence from where the arms ACTUALLY ARE at the
         # moment [r] was pressed, not from a reading taken earlier.
+        # [RT4] Fresh stream -> FOLLOW. Otherwise HOLD where the arms ARE, and wait for a
+        # live stream and a second [r].
+        if not STOP:
+            REENGAGE = False
+            link_guard.start(time.monotonic(), arm_ctrl.get_current_dual_arm_q())
+            if tau_cap is not None:
+                tau_cap.reset(arm_ctrl.get_current_dual_arm_q())
         if start_seq.enabled and not STOP:
             start_seq.start(time.monotonic(), arm_ctrl.get_current_dual_arm_q())
             notice(f"[start-pose] approaching over {start_seq.start_t:g}s, "
@@ -563,7 +881,39 @@ if __name__ == '__main__':
         left_wrist_img = None
         right_wrist_img = None
 
+        # [RT5] Session stats, to logs/launcher_stats_<pid>.csv every XR_STATS_S seconds
+        # (default 5, 0 = off). File only, so the operator's pane stays readable: loop
+        # rate, how many loops saw a NEW wrist pose, IK time, new head frames rendered to
+        # the headset, and the guard state. Never allowed to break the loop.
+        try:
+            _st_period = float(os.environ.get("XR_STATS_S", "5") or 0)
+        except ValueError:
+            _st_period = 0.0
+        _st = {"t0": time.monotonic(), "loops": 0, "fresh": 0, "ik": [], "img_new": 0,
+               "img_fps": 0.0, "last_jpg": None, "margin_clips": 0}
+        _st_fh = None
+        if _st_period > 0:
+            try:
+                _st_fh = open(os.path.join(parent_dir, "logs",
+                                           f"launcher_stats_{os.getpid()}.csv"), "a", buffering=1)
+                _st_fh.write("t_mono,loop_hz,fresh_per_s,ik_p50_ms,ik_p99_ms,ik_max_ms,"
+                             "img_new_per_s,img_client_fps,guard,"
+                             "sp_ff_pred_max_L_nm,sp_ff_pred_max_R_nm,sp_ff_cmd_max_L_nm,"
+                             "sp_ff_cmd_max_R_nm,cap_frames_L,cap_frames_R,"
+                             "ctrl_steps,clip_steps,clip_steps_L,clip_steps_R,margin_clips\n")
+            except OSError:
+                _st_fh = None
+
+        _cap_on, _cap_free = [False, False], [0, 0]    # [RT6d] per arm, for the [cap] notices
         # main loop. robot start to follow VR user's motion
+        _tlog = {"fh": None}
+        if os.environ.get("XR_TARGET_LOG"):
+            try:
+                _tlog["fh"] = open(os.environ["XR_TARGET_LOG"], "a", buffering=1)
+                _tlog["fh"].write("t_mono,guard," + ",".join(f"tgt_{i}" for i in range(15, 29)) + ","
+                                  + ",".join(f"meas_{i}" for i in range(15, 29)) + "\n")
+            except OSError:
+                _tlog["fh"] = None
         while not STOP:
             start_time = time.time()
             # get image
@@ -572,6 +922,11 @@ if __name__ == '__main__':
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+                    _jpg = getattr(head_img, "jpg", None)
+                    if _jpg is not None and _jpg is not _st["last_jpg"]:
+                        _st["img_new"] += 1
+                        _st["last_jpg"] = _jpg
+                        _st["img_fps"] = float(getattr(head_img, "fps", 0.0) or 0.0)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -595,7 +950,16 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if args.ee in ("dex3", "dex5", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
+            # [RT4] Freshness of the wrist data, then any [r] the operator gave.
+            _t_lg = time.monotonic()
+            if link_guard.observe(_t_lg, link_guard_mod.wrist_marker(tv_wrapper.tvuer)):
+                _st["fresh"] += 1
+            if REENGAGE:
+                REENGAGE = False
+                link_guard.request_reengage(_t_lg)
+            if link_guard.holding:
+                pass    # [RT4] HOLD: the hand targets are not updated either; the hands hold.
+            elif args.ee in ("dex3", "dex5", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -653,7 +1017,30 @@ if __name__ == '__main__':
             left_wrist_target, right_wrist_target = wrist_map.apply_pair(
                 tele_data.left_wrist_pose, tele_data.right_wrist_pose)
             sol_q, sol_tauff  = arm_ik.solve_ik(left_wrist_target, right_wrist_target, current_lr_arm_q, current_lr_arm_dq)
+            if _ik_lo is not None:
+                _q_in = np.clip(sol_q, _ik_lo, _ik_hi)
+                if not np.array_equal(_q_in, sol_q):
+                    sol_q, sol_tauff = _q_in, _ik_gfn(_q_in)
+                    _st["margin_clips"] += 1
+            # [RT6d] Shoulder pitch torque cap: past the limit, the reach stops where the
+            # limit is met on the way to the IK solution. Pass-through (same objects) below it.
+            if tau_cap is not None:
+                sol_q, sol_tauff = tau_cap.step(sol_q, sol_tauff, current_lr_arm_q)
+                # Notices with 1 s of hysteresis, so an operator at the edge is not a flood;
+                # none while the link guard holds (the arms are not following then anyway).
+                for _a, _side in enumerate(("left", "right") if not link_guard.holding else ()):
+                    if tau_cap.capped[_a]:
+                        _cap_free[_a] = 0
+                        if not _cap_on[_a]:
+                            _cap_on[_a] = True
+                            notice(f"[cap] {_side} shoulder pitch at the {tau_cap.limit:g} Nm limit: sliding along it")
+                    elif _cap_on[_a]:
+                        _cap_free[_a] += 1
+                        if _cap_free[_a] >= args.frequency:
+                            _cap_on[_a] = False
+                            notice(f"[cap] {_side} shoulder pitch back under the limit: following")
             time_ik_end = time.time()
+            _st["ik"].append(time_ik_end - time_ik_start)
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             # [panthera] Start-pose sequence (G4). Pass-through unless XR_START_POSE is
             # set. sol_tauff is the gravity feed-forward computed FOR sol_q, so it is
@@ -662,7 +1049,19 @@ if __name__ == '__main__':
             cmd_q = start_seq.step(time.monotonic(), current_lr_arm_q, sol_q,
                                    dt=1.0 / args.frequency)
             cmd_tauff = sol_tauff if cmd_q is sol_q else sol_tauff * 0.0
+            # [RT4] Link guard last: FOLLOW passes through; HOLD freezes; BLEND re-engages.
+            cmd_q, cmd_tauff = link_guard.step(time.monotonic(), cmd_q, cmd_tauff,
+                                               dt=1.0 / args.frequency)
             arm_ctrl.ctrl_dual_arm(cmd_q, cmd_tauff)
+            # [RT7] Per loop: the IK target given to the controller (before its speed limiter),
+            # the raw IK solution and the measured arm q, to XR_TARGET_LOG (CSV). Logging only.
+            if _tlog["fh"] is not None:
+                try:
+                    _tlog["fh"].write(f"{time.monotonic():.3f},{link_guard.state},"
+                                      + ",".join(f"{v:.4f}" for v in cmd_q) + ","
+                                      + ",".join(f"{v:.4f}" for v in current_lr_arm_q) + "\n")
+                except Exception:
+                    _tlog["fh"] = None
 
             # record data
             if args.record:
@@ -833,6 +1232,26 @@ if __name__ == '__main__':
                     else:
                         recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
+            _st["loops"] += 1
+            if _st_fh is not None and time.monotonic() - _st["t0"] >= _st_period:
+                try:
+                    _dt = time.monotonic() - _st["t0"]
+                    _ik = np.asarray(_st["ik"]) * 1000.0 if _st["ik"] else np.zeros(1)
+                    _st_fh.write(f"{time.monotonic():.2f},{_st['loops'] / _dt:.1f},"
+                                 f"{_st['fresh'] / _dt:.1f},{np.percentile(_ik, 50):.2f},"
+                                 f"{np.percentile(_ik, 99):.2f},{_ik.max():.2f},"
+                                 f"{_st['img_new'] / _dt:.1f},{_st['img_fps']:.1f},"
+                                 f"{link_guard.state},"
+                                 + (",".join(f"{v:.2f}" if isinstance(v, float) else str(v)
+                                             for v in tau_cap.read_stats())
+                                    if tau_cap is not None else ",,,,,")
+                                 + "," + (",".join(str(v) for v in arm_ctrl.read_clip_stats())
+                                          if hasattr(arm_ctrl, "read_clip_stats") else ",,,")
+                                 + f",{_st['margin_clips']}\n")
+                except Exception:
+                    pass
+                _st.update(t0=time.monotonic(), loops=0, fresh=0, ik=[], img_new=0, margin_clips=0)
+
             current_time = time.time()
             time_elapsed = current_time - start_time
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
@@ -852,16 +1271,73 @@ if __name__ == '__main__':
         try:
             # [panthera] Only if it was ever built -- see the arm_ctrl = None above.
             if arm_ctrl is not None:
-                arm_ctrl.ctrl_dual_arm_go_home()
+                # [RT6b] Lower and release instead of go-home (q = 0). In RT6 go-home could
+                # not reach q = 0 against gravity, and the arms fell as soon as the
+                # process stopped commanding them.
+                if getattr(arm_ctrl, "released", None):
+                    # [RT7] Released at once earlier (chatter or a stop during the lowering):
+                    # zero torque stays, no lowering, nothing else commanded.
+                    notice(f"[lower] no lowering: RELEASED AT ONCE (zero torque) earlier: {arm_ctrl.released}")
+                elif hasattr(arm_ctrl, "lower_and_release") and not args.motion:
+                    _gfn = None
+                    try:
+                        import pinocchio as _pin
+                        _gm = arm_ik.reduced_robot.model
+                        _gd = _gm.createData()
+                        _z = np.zeros(_gm.nv)
+                        _gfn = lambda q: _pin.rnea(_gm, _gd, np.asarray(q, dtype=float), _z, _z)
+                    except Exception as e:
+                        logger_mp.error(f"[lower] no gravity model ({e}); lowering without feed-forward")
+                    notice("[lower] lowering the arms to the rest pose, then releasing")
+                    _ok, _secs = arm_ctrl.lower_and_release(q_rest=rest_pose, gravity_fn=_gfn,
+                                                            speed=lower_speed, release_t=release_t)
+                    if getattr(arm_ctrl, "released", None):
+                        notice(f"[lower] RELEASED AT ONCE (zero torque) after {_secs:.1f} s: {arm_ctrl.released}")
+                    else:
+                        notice(f"[lower] {'done' if _ok else 'TIMED OUT'} in {_secs:.1f} s")
+                    # [RT6f] Remember where the arms were released, for the next start's
+                    # "arms were moved" check.
+                    if _ok and last_pose_path:
+                        try:
+                            start_gate_mod.save_last(last_pose_path, arm_ctrl.get_current_dual_arm_q(),
+                                                     note=f"lower_and_release ok in {_secs:.1f} s")
+                            notice(f"[gate] released pose saved ({os.path.basename(last_pose_path)})")
+                        except Exception as e:
+                            logger_mp.error(f"[gate] could not save the released pose: {e}")
+                else:
+                    arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+        try:
+            if ik_worker is not None:
+                ik_worker.close()
+        except Exception as e:
+            logger_mp.error(f"[ik] worker close: {e}")
         
         try:
             if args.ipc:
                 ipc_server.stop()
             else:
                 stop_listening()
-                listen_keyboard_thread.join()
+                # [RT5c] Bounded. sshkeyboard only sees the stop flag on its next loop
+                # turn, which needs its stdin read to return. If anything has made that
+                # read blocking (RT5b: a child process that inherited the tty cleared
+                # O_NONBLOCK), the turn never comes and an unbounded join() hangs the
+                # exit after go-home until someone kills the session. The thread is a
+                # daemon, so leaving it behind cannot keep the process alive.
+                try:
+                    _kb_join_s = float(os.environ.get("XR_KEYBOARD_JOIN_S", "1.0"))
+                except ValueError:
+                    _kb_join_s = 1.0
+                listen_keyboard_thread.join(timeout=_kb_join_s)
+                if listen_keyboard_thread.is_alive():
+                    notice(f"[key] keyboard listener did not stop within {_kb_join_s:g} s; "
+                           f"continuing the exit (non-fatal)")
+                    try:
+                        if _tty_saved is not None:
+                            _termios.tcsetattr(sys.stdin.fileno(), _termios.TCSANOW, _tty_saved)
+                    except Exception:
+                        pass
         except Exception as e:
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
         
@@ -903,4 +1379,22 @@ if __name__ == '__main__':
         logger_mp.info("✅ Finally, exiting program.")
         # [panthera] exit_code wins when a pre-flight refused, so the caller learns
         # WHICH check failed (3 = no ee state, 4 = port busy) instead of a flat 1.
-        exit(exit_code if exit_code is not None else (1 if had_exception else 0))
+        if exit_code is None and _signal_stop["sig"] in (_signal.SIGHUP, _signal.SIGTERM):
+            exit_code = EXIT_HANGUP if _signal_stop["sig"] == _signal.SIGHUP else EXIT_TERMINATED
+        _final_code = exit_code if exit_code is not None else (1 if had_exception else 0)
+        # [RT5c] The builtin exit() first calls sys.stdin.close(), which waits for the
+        # stdin lock -- held forever by a keyboard thread stuck in its read. That was the
+        # second half of the RT5b hang after [q]. Children are already reaped above, so
+        # in that case leave by os._exit() after flushing.
+        try:
+            _kb_stuck = (not args.ipc) and listen_keyboard_thread.is_alive()
+        except Exception:
+            _kb_stuck = False
+        if _kb_stuck:
+            for _stream in (sys.stdout, sys.stderr):
+                try:
+                    _stream.flush()
+                except Exception:
+                    pass
+            os._exit(_final_code)
+        exit(_final_code)

@@ -34,14 +34,20 @@ DEFAULT_PORT = 8012
 def port_is_free(port, host="0.0.0.0"):
     """True if `host:port` can be bound right now.
 
-    Deliberately WITHOUT SO_REUSEADDR: the question is "would vuer's bind succeed",
-    and vuer does not set it either. With SO_REUSEADDR this would happily bind
-    alongside a listener on 127.0.0.1:<port> and report a free port that is not.
+    The question is "would vuer's bind succeed". [RT4] vuer binds through aiohttp's
+    web.TCPSite with reuse_address left at None, and asyncio then sets SO_REUSEADDR on
+    POSIX -- so vuer DOES set it, and this check now does too. Without it, the
+    TIME_WAIT that every closed headset connection leaves on :8012 for about 60 s made
+    this report "busy" while vuer could bind fine, and the next launcher refused with
+    exit 4 (found by G7, 18 Oct 2026). On Linux SO_REUSEADDR still refuses to bind next
+    to a socket that is LISTENING on the port, on 0.0.0.0 or on 127.0.0.1, so a real
+    holder is still caught (G1 case b, G2 case 3).
 
     The socket is closed immediately, so this never holds the port itself -- which is
     the whole bug it exists to prevent.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind((host, port))
         return True

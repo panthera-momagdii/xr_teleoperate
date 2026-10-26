@@ -205,6 +205,8 @@ def main():
         ok = args.case == "dex5"
         print(f"RESULT: {'as expected' if ok else 'UNEXPECTED -- should have refused'}")
         sys.stdout.flush()
+        from tools._procs import reap_child_processes   # [RT4] reap the control loop and logging_mp's listener
+        reap_child_processes()
         os._exit(0 if ok else 1)          # daemon control process is still running
     except RuntimeError as exc:
         elapsed = time.monotonic() - started
@@ -224,6 +226,8 @@ def main():
             ok = False
             print("RESULT: UNEXPECTED -- dex5 case should have succeeded")
         sys.stdout.flush()
+        from tools._procs import reap_child_processes   # [RT4] reap the control loop and logging_mp's listener
+        reap_child_processes()
         os._exit(0 if ok else 1)
 
 

@@ -42,10 +42,87 @@ import os
 import signal
 import threading
 
-__all__ = ["reap_child_processes", "install_reaper", "stop_logging_mp_listener"]
+__all__ = ["reap_child_processes", "install_reaper", "stop_logging_mp_listener",
+           "install_parent_death_signal"]
 
 _installed = False
+_pdeath_installed = False
 _lock = threading.Lock()
+
+
+def install_parent_death_signal(sig=signal.SIGKILL,
+                                reset_in_child=(signal.SIGHUP, signal.SIGTERM)):
+    """Every multiprocessing child started after this dies when its parent dies. RT4.
+
+    Nothing above covers SIGKILL: no handler, no finally and no atexit runs, so the
+    children of a killed launcher -- the hand controllers' control loops, which publish
+    rt/inspire_hand/ctrl/*, televuer's vuer server, which holds 8012, and logging_mp's
+    listener -- were left running with PPID 1. Linux's PR_SET_PDEATHSIG makes the
+    kernel send `sig` to the child the moment its parent goes, whatever killed it.
+
+    How: BaseProcess.start() records the parent PID; BaseProcess._bootstrap(), which
+    runs first thing in the child, calls prctl(PR_SET_PDEATHSIG) and then checks the
+    parent is still the one that forked it (a parent that died between fork and prctl
+    would otherwise be missed).
+
+    `reset_in_child`: the child also puts these signals back to SIG_DFL. A fork copies
+    the parent's Python signal handlers, and the launcher's SIGHUP/SIGTERM handler is
+    an orderly-stop for the PARENT; in a child it would only set a flag nobody reads,
+    and the child would survive the hang-up that should end it.
+
+    Caveat, and the reason for the main-thread check: the kernel fires the signal when
+    the parent THREAD that forked the child exits, not the process. A child started
+    from a worker thread would be killed when that thread ends, so only children
+    started from the main thread are armed. Every child the launcher has is.
+
+    Linux only; a no-op elsewhere. Idempotent. Must run BEFORE the first child is
+    started -- for the launcher that means before `import logging_mp`.
+    """
+    global _pdeath_installed
+    import sys
+    if not sys.platform.startswith("linux"):
+        return False
+    with _lock:
+        if _pdeath_installed:
+            return True
+        _pdeath_installed = True
+    import ctypes
+    import multiprocessing.process as _mpp
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return False
+    PR_SET_PDEATHSIG = 1
+    orig_start = _mpp.BaseProcess.start
+    orig_bootstrap = _mpp.BaseProcess._bootstrap
+
+    def start(self, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            self._panthera_parent_pid = os.getpid()
+        else:
+            self._panthera_parent_pid = None
+        return orig_start(self, *args, **kwargs)
+
+    def _bootstrap(self, *args, **kwargs):
+        parent = getattr(self, "_panthera_parent_pid", None)
+        if parent is not None:
+            try:
+                libc.prctl(PR_SET_PDEATHSIG, int(sig), 0, 0, 0)
+                if os.getppid() != parent:
+                    os._exit(1)
+            except Exception:
+                pass
+        for s in reset_in_child:
+            try:
+                signal.signal(s, signal.SIG_DFL)
+            except Exception:
+                pass
+        return orig_bootstrap(self, *args, **kwargs)
+
+    _mpp.BaseProcess.start = start
+    _mpp.BaseProcess._bootstrap = _bootstrap
+    return True
 
 
 def _quiet(log, level, msg):

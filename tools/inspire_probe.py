@@ -175,4 +175,8 @@ if __name__ == "__main__":
     rc = main()
     sys.stdout.flush()
     sys.stderr.flush()
+    # [RT4] Same leak domain0_census.py had: os._exit() skips atexit, so logging_mp's
+    # listener was orphaned. Reap it first.
+    from tools._procs import reap_child_processes
+    reap_child_processes()
     os._exit(rc)

@@ -150,10 +150,16 @@ class G1_29_ArmIK:
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
         # Setting optimization constraints and goals
+        # [RT6g] Keep every arm joint XR_IK_JOINT_MARGIN (rad, default 0.1) inside its URDF
+        # limit. RT6e: at 1:1 with the arms out front the IK put both shoulder yaws within
+        # 0.011 and 0.002 rad of +-2.618, and the lowering then had a 2.61 rad move.
+        self.joint_margin = float(os.environ.get("XR_IK_JOINT_MARGIN", "0.1") or 0.0)
+        self.ik_lower = self.reduced_robot.model.lowerPositionLimit + self.joint_margin
+        self.ik_upper = self.reduced_robot.model.upperPositionLimit - self.joint_margin
         self.opti.subject_to(self.opti.bounded(
-            self.reduced_robot.model.lowerPositionLimit,
+            self.ik_lower,
             self.var_q,
-            self.reduced_robot.model.upperPositionLimit)
+            self.ik_upper)
         )
         self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
 
@@ -179,6 +185,12 @@ class G1_29_ArmIK:
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
         self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        # [RT6h] IPOPT starts from its own last raw solution (XR_IK_WARM_LAST, default on)
+        # instead of the measured pose. The problem is unchanged: var_q_last, the
+        # smoothing reference, is still the measured pose. With both arms capped the
+        # measured pose sits far from the target and the solve took 13 ms p50 (7.6 uncapped).
+        self.warm_last = os.environ.get("XR_IK_WARM_LAST", "1") == "1"
+        self._warm = None
         self.vis = None
 
         if self.Visualization:
@@ -253,7 +265,7 @@ class G1_29_ArmIK:
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
             self.init_data = current_lr_arm_motor_q
-        self.opti.set_initial(self.var_q, self.init_data)
+        self.opti.set_initial(self.var_q, self._warm if self._warm is not None else self.init_data)
 
         # left_wrist, right_wrist = self.scale_arms(left_wrist, right_wrist)
         if self.Visualization:
@@ -269,6 +281,7 @@ class G1_29_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
+            self._warm = np.array(sol_q) if self.warm_last else None
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
 
@@ -290,6 +303,7 @@ class G1_29_ArmIK:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
 
             sol_q = self.opti.debug.value(self.var_q)
+            self._warm = None
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
 

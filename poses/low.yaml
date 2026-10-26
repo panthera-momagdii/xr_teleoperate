@@ -1,0 +1,32 @@
+# low pose for xr_teleoperate, G1_29 arms. RT6b, 21 Oct 2026.
+#
+# The lowest-torque start pose we found on the IK model (teleop/robot_control/robot_arm_ik.py,
+# reduced G1_29 model, gravity by pin.rnea), chosen after RT6 stopped on shoulder temperature:
+#   shoulder pitch gravity torque -0.12 / -0.12 Nm  (ready.yaml: -5.02 / -5.02 Nm; q = 0: -3.91)
+#   sum of |gravity torque| over the 14 arm joints 4.7 Nm (ready.yaml 21.3)
+#   hands beside the body, slightly ahead: L_ee (0.028, +0.192, -0.122) m,
+#   R_ee (0.028, -0.192, -0.122) m in the IK base frame
+#   every joint at least 0.89 rad inside its URDF limits
+#
+# Arms hanging, shoulders 0.15 rad forward, 0.10 rad outward, elbows slightly bent
+# (1.20 rad; this URDF reads 0 with the elbow already bent ~90 degrees), wrists neutral.
+# Derived on the model, not captured off the robot.
+
+name: low
+robot: G1_29
+units: radians
+joints:
+  left_shoulder_pitch_joint:  +0.150000
+  left_shoulder_roll_joint:   +0.100000
+  left_shoulder_yaw_joint:    +0.000000
+  left_elbow_joint:           +1.200000
+  left_wrist_roll_joint:      +0.000000
+  left_wrist_pitch_joint:     +0.000000
+  left_wrist_yaw_joint:       +0.000000
+  right_shoulder_pitch_joint: +0.150000
+  right_shoulder_roll_joint:  -0.100000
+  right_shoulder_yaw_joint:   +0.000000
+  right_elbow_joint:          +1.200000
+  right_wrist_roll_joint:     +0.000000
+  right_wrist_pitch_joint:    +0.000000
+  right_wrist_yaw_joint:      +0.000000

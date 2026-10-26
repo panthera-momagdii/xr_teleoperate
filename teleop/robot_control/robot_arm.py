@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import threading
 import time
@@ -83,6 +84,9 @@ class G1_29_ArmController:
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
+        # [RT6e] Tests only: XR_SIM_VEL_CLIP=1 applies the real robot's velocity clip in
+        # --sim too, so the fakes move the arms the way the robot is commanded to.
+        self._sim_clip = os.environ.get("XR_SIM_VEL_CLIP", "") == "1"
         self.kp_high = 300.0
         self.kd_high = 3.0
         self.kp_low = 80.0
@@ -90,8 +94,12 @@ class G1_29_ArmController:
         self.kp_wrist = 40.0
         self.kd_wrist = 1.5
 
+        self._clip_stats = [0, 0, 0, 0]   # [RT6g] see clip_arm_q_target
         self.all_motor_q = None
-        self.set_arm_velocity_limit()
+        # [RT6e] The launcher's XR_ARM_VEL_LIMIT from the FIRST command, not 30 rad/s until
+        # set_arm_velocity_limit() is called after construction. On fakes the gap moved a
+        # wrist 0.12 rad in one step; RT6 logged 3.42 rad/s on a wrist as the motors came on.
+        self.set_arm_velocity_limit(self.INIT_VEL_LIMIT if self.INIT_VEL_LIMIT else 30.0)
         self.control_dt = 1.0 / 250.0
 
         if self.motion_mode:
@@ -143,6 +151,31 @@ class G1_29_ArmController:
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
         logger_mp.info("Lock OK!")
 
+        # [RT6b] Remember where the arms rest (measured before anything is commanded --
+        # on the gantry in debug mode that is the limp hanging pose) and the gains every
+        # motor was given, for lower_and_release() at exit.
+        self.q_rest = self.get_current_dual_arm_q().copy()
+        # [RT6f] Never record a rest pose near a joint limit (the launcher's start gate
+        # refuses first; this is defence in depth). Raised before the publish thread
+        # starts, so nothing has been commanded.
+        if self.REST_GUARD is not None:
+            from teleop.robot_control.start_gate import (StartGateError, describe_violations,
+                                                         limit_violations)
+            _viol = limit_violations(self.q_rest, *self.REST_GUARD)
+            if _viol:
+                raise StartGateError(describe_violations(_viol, self.REST_GUARD[2]))
+        self._base_kp = {id: float(self.msg.motor_cmd[id].kp) for id in G1_29_JointIndex}
+        self._lower = None
+        self._lower_done = threading.Event()
+        # [RT7] Release at once (zero torque on every motor this process commands), latched.
+        # Set by release_now(): the launcher on a second stop during the lowering, and the
+        # arm watcher on chatter through XR_RELEASE_FILE (honoured only if written after this
+        # controller started, so a stale file from an earlier run cannot fire).
+        self._released = None
+        self._release_file = (os.environ.get("XR_RELEASE_FILE", "").strip() or None)
+        self._t_started = time.time()
+        self._release_poll = 0
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -169,20 +202,71 @@ class G1_29_ArmController:
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
+        # [RT6g] Count 4 ms control steps the speed limit clipped: in total (the scale is
+        # uniform over both arms) and per arm (that arm's own step was over the limit).
+        st = self._clip_stats
+        st[0] += 1
+        if motion_scale > 1.0:
+            st[1] += 1
+            step = velocity_limit * self.control_dt
+            st[2] += int(np.max(np.abs(delta[:7])) > step)
+            st[3] += int(np.max(np.abs(delta[7:])) > step)
         return cliped_arm_q_target
+
+    def read_clip_stats(self):
+        """(control steps, clipped steps, clipped left, clipped right) since the last call."""
+        out = tuple(self._clip_stats)
+        self._clip_stats = [0, 0, 0, 0]
+        return out
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
             self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
 
+        next_t = time.monotonic()
         while True:
             start_time = time.time()
 
             with self.ctrl_lock:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
+                lower = self._lower
 
-            if self.simulation_mode:
+            if self._released is None and self._release_file is not None:
+                self._release_poll += 1
+                if self._release_poll % 5 == 0:                  # every 20 ms
+                    try:
+                        if os.path.getmtime(self._release_file) >= self._t_started:
+                            with open(self._release_file) as _fh:
+                                _why = _fh.read().strip()[:200]
+                            self.release_now(f"release file: {_why or 'no reason given'}")
+                    except OSError:
+                        pass
+            if self._released is not None:
+                # [RT7] Zero torque: kp = kd = 0, no feed-forward, on every motor, every step.
+                for id in G1_29_JointIndex:
+                    self.msg.motor_cmd[id].kp = 0.0
+                    self.msg.motor_cmd[id].kd = 0.0
+                    self.msg.motor_cmd[id].tau = 0.0
+                    self.msg.motor_cmd[id].dq = 0.0
+                self.msg.crc = self.crc.Crc(self.msg)
+                self.lowcmd_publisher.Write(self.msg)
+                next_t += self.control_dt
+                sleep_time = next_t - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                elif sleep_time < -self.control_dt:
+                    next_t = time.monotonic()
+                continue
+
+            if lower is not None:
+                # [RT6b] Controlled lowering: a planned trajectory, NOT relative to the
+                # measured pose (the clip below is, which is why go-home could neither lift
+                # nor hold an arm and why the arms fell at exit in RT6), with gravity
+                # feed-forward for the commanded pose, the error to the measured pose
+                # bounded, then every gain ramped to zero.
+                cliped_arm_q_target, arm_tauff_target = self._lower_step(lower)
+            elif self.simulation_mode and not self._sim_clip:
                 cliped_arm_q_target = arm_q_target
             else:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
@@ -195,12 +279,34 @@ class G1_29_ArmController:
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
 
-            current_time = time.time()
-            all_t_elapsed = current_time - start_time
-            sleep_time = max(0, (self.control_dt - all_t_elapsed))
-            time.sleep(sleep_time)
+            # [RT6h] Absolute deadlines. Sleeping control_dt minus the work time ran at
+            # 246 Hz with nothing else running (every sleep overshoots); now each step has
+            # its own slot. A step more than one slot late re-anchors instead of bursting.
+            next_t += self.control_dt
+            sleep_time = next_t - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            elif sleep_time < -self.control_dt:
+                next_t = time.monotonic()
             # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
             # logger_mp.debug(f"sleep_time:{sleep_time}")
+
+    def release_now(self, reason):
+        """[RT7] Zero torque at once on every motor (latched); ends a lowering in progress.
+        The arms fall limp: used on chatter (never keep gains that chattered) and on any
+        stop during the lowering (owner, 23 Oct)."""
+        if self._released is None:
+            self._released = str(reason)
+            logger_mp.error(f"[G1_29_ArmController] RELEASED AT ONCE (zero torque): {reason}")
+        self._lower_done.set()
+
+    @property
+    def released(self):
+        return self._released
+
+    @property
+    def lowering(self):
+        return self._lower is not None and not self._lower_done.is_set()
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
@@ -226,6 +332,235 @@ class G1_29_ArmController:
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
+    LOWER_ARM_IDX = (0, 1, 2, 3, 7, 8, 9, 10)     # shoulders and elbows, both arms
+    LOWER_WRIST_IDX = (4, 5, 6, 11, 12, 13)       # wrist roll, pitch, yaw, both arms
+
+    def _make_lower_plan(self, q0, q_rest, gravity_fn, speed, hold_t, release_t, max_err,
+                         profile, wrist_speed, wrist_lead, t_start, cmd_vel=0.0):
+        """[RT6g] The lowering plan as a dict, for _lower_step. min-jerk: two groups with
+        their own clock and governor: shoulders+elbows peak at LOWER_PLAN_FRAC * speed,
+        wrists peak at wrist_speed with a smaller command lead (wrist_lead), because in
+        RT6e the wrist rolls read 0.33 to 0.42 rad/s against a 0.18 rad/s plan (stick-slip
+        under a 0.15 rad lead at kp 40 is a 6 Nm push). linear: the RT6b plan, one group.
+        [RT6h] cmd_vel > 0: the command itself is rate limited (see _lower_step)."""
+        delta = q_rest - q0
+        if profile == "linear":
+            groups = [dict(idx=np.arange(14), peak=float(speed))]
+        else:
+            groups = [dict(idx=np.array(self.LOWER_ARM_IDX), peak=self.LOWER_PLAN_FRAC * float(speed)),
+                      dict(idx=np.array(self.LOWER_WRIST_IDX), peak=float(wrist_speed))]
+        for gr in groups:
+            d = float(np.max(np.abs(delta[gr["idx"]])))
+            if speed <= 0 or gr["peak"] <= 0:
+                gr["T"] = 0.0
+            elif profile == "linear":
+                gr["T"] = d / gr["peak"]
+            else:
+                gr["T"] = 1.875 * d / gr["peak"]
+            gr.update(tau=0.0, gov_off=False, dq_f=np.zeros(len(gr["idx"])), v_max=0.0, gov_steps=0)
+        lead = np.full(14, float(max_err))
+        if profile != "linear":
+            lead[list(self.LOWER_WRIST_IDX)] = float(wrist_lead)
+        T = max(gr["T"] for gr in groups)
+        return dict(q0=q0.copy(), q_rest=q_rest.copy(), delta=delta, T=T, t0=t_start, t_last=t_start,
+                    t_end=(t_start if T <= 0 else None), profile=profile, groups=groups,
+                    gov_lo=self.LOWER_GOV[0] * float(speed), gov_hi=self.LOWER_GOV[1] * float(speed),
+                    fade=(self.LOWER_LEAD_FADE[0] * float(speed), self.LOWER_LEAD_FADE[1] * float(speed)),
+                    hold_t=float(hold_t), release_t=float(release_t), lead=lead,
+                    gravity_fn=gravity_fn, last_w=1.0, cmd_vel=float(cmd_vel), q_cmd=q0.copy())
+
+    def _lower_step(self, lo):
+        now = time.monotonic()
+        dt = now - lo["t_last"]
+        lo["t_last"] = now
+        hold_t, rel_t = lo["hold_t"], lo["release_t"]
+        q_traj = lo["q_rest"].copy()
+        dq_all = None
+        for gr in lo["groups"]:
+            T, idx = gr["T"], gr["idx"]
+            # [RT6d] Speed governor, per group: the group's clock runs at full rate while
+            # its joints read under gov_lo (rad/s, lightly filtered), slows linearly above
+            # it and stops at gov_hi. Watchdog: past 2 T + 10 s the governor is overridden
+            # and the min-jerk plan runs on its own.
+            if lo["profile"] == "minjerk" and not gr["gov_off"] and now - lo["t0"] >= 2.0 * T + 10.0:
+                gr["gov_off"] = True
+            k = 1.0
+            if lo["profile"] == "minjerk" and not gr["gov_off"]:
+                if dq_all is None:
+                    dq_all = np.abs(self.get_current_dual_arm_dq())
+                gr["dq_f"] = 0.8 * gr["dq_f"] + 0.2 * dq_all[idx]
+                v = float(np.max(gr["dq_f"]))
+                k = 1.0 if v <= lo["gov_lo"] else max(0.0, (lo["gov_hi"] - v) / (lo["gov_hi"] - lo["gov_lo"]))
+                if k < 1.0:
+                    gr["gov_steps"] += 1
+                gr["v_max"] = max(gr["v_max"], v)
+            if gr["tau"] < T:
+                gr["tau"] = min(T, gr["tau"] + k * dt)
+            x = gr["tau"] / T if T > 0 else 1.0
+            if x < 1.0:
+                # min-jerk: zero speed and acceleration at both ends, peak 1.875 * mean speed
+                sc = x if lo["profile"] == "linear" else x ** 3 * (10.0 - 15.0 * x + 6.0 * x * x)
+                q_traj[idx] = lo["q0"][idx] + lo["delta"][idx] * sc
+        if lo["t_end"] is None and all(gr["tau"] >= gr["T"] for gr in lo["groups"]):
+            lo["t_end"] = now
+        w = 1.0
+        t = (now - lo["t_end"]) if lo["t_end"] is not None else -1.0
+        if t >= hold_t:
+            w = max(0.0, 1.0 - (t - hold_t) / rel_t) if rel_t > 0 else 0.0
+        meas = self.get_current_dual_arm_q()
+        lead = lo["lead"]
+        if lo["profile"] == "minjerk":
+            # [RT6g] Per-joint speed limit on the push: a joint reading faster than
+            # LOWER_LEAD_FADE[0] * speed gets less lead, none at [1] * speed, so the PD only
+            # damps it (kd, dq target 0). With gearbox stick-slip a joint that breaks loose
+            # can no longer be driven past the limit by a lead built up while it stuck.
+            if dq_all is None:
+                dq_all = np.abs(self.get_current_dual_arm_dq())
+            v0, v1 = lo["fade"]
+            lead = lead * np.clip((v1 - dq_all) / (v1 - v0), 0.0, 1.0)
+        q_cmd = meas + np.clip(q_traj - meas, -lead, lead)
+        if lo["cmd_vel"] > 0.0:
+            # [RT6h] Rate-limited command: it moves at most cmd_vel * dt per step from the
+            # last command, whatever the measured pose does. Before, the command was
+            # measured + lead, so a joint that broke loose after sticking carried its
+            # command (and the full kp * lead push) along with it: 0.55 to 0.60 rad/s in
+            # RT6g. Now a joint faster than cmd_vel overtakes its command and kp brakes it.
+            step = lo["cmd_vel"] * max(dt, 0.0)
+            q_cmd = lo["q_cmd"] + np.clip(q_cmd - lo["q_cmd"], -step, step)
+            lo["q_cmd"] = q_cmd.copy()
+        tau = np.zeros(14)
+        if lo["gravity_fn"] is not None:
+            try:
+                tau = np.asarray(lo["gravity_fn"](q_traj), dtype=float) * w
+            except Exception:
+                tau = np.zeros(14)
+        for id in G1_29_JointIndex:
+            self.msg.motor_cmd[id].kp = self._base_kp[id] * w
+        lo["last_w"] = w
+        if w <= 0.0 and not self._lower_done.is_set():
+            self._lower_done.set()
+        return q_cmd, tau
+
+    REST_GUARD = None         # [RT6f] (lower, upper, margin) set by the launcher's start gate
+    INIT_VEL_LIMIT = None     # [RT6e] rad/s from the first command; set by the launcher
+    LOWER_PLAN_FRAC = 0.6     # [RT6d] planned peak joint speed, as a fraction of `speed`
+    LOWER_GOV = (0.7, 0.85)   # [RT6d] governor: slows above 0.7 * speed, stops at 0.85 * speed
+    LOWER_LEAD_FADE = (0.6, 0.8)  # [RT6g] per joint: lead fades above 0.6 * speed, none at 0.8
+    # [RT7, 23 Oct 2026] Back to the RT6g values. The RT6h defaults (command rate 0.2 rad/s,
+    # kd 10 shoulders/elbows, kd 24 wrists, wrist lead 0.12) were run once on the robot (RT7,
+    # 20:16:51, a [q] lowering): all six wrist motors chattered at full torque (dq sign flips
+    # 300 to 500 per second, tau_est swings 25 to 52 Nm), the elbows spiked to 6 to 8 rad/s,
+    # and the winding temperature [1] read up to 131 C (Unitree limit 130). High kd on these
+    # motors is UNSTABLE on the robot; the simulated arm did not show it. The RT6h knobs stay
+    # (XR_LOWER_CMD_VEL, XR_LOWER_KD, XR_LOWER_WRIST_KD, XR_LOWER_WRIST_LEAD) but do not raise
+    # a kd without a supervised test.
+    # [RT7, owner 23 Oct, after the power cycle] The lowering keeps the gains that ran stable
+    # while following in RT6g and while holding on 23 Oct (kp 80 / kd 3 shoulders and
+    # elbows, kp 40 / kd 1.5 wrists): no kd is raised (0 = keep the following kd). The
+    # command is capped at 0.2 rad/s.
+    LOWER_CMD_VEL = 0.2       # [RT6h] rad/s, the lowering command's own rate limit (XR_LOWER_CMD_VEL); 0 = off
+    LOWER_ARM_KD = 0.0        # [RT6h] shoulders and elbows kd while lowering (XR_LOWER_KD); 0 = keep
+    LOWER_ARM_LEAD = 0.15     # [RT6h] rad, shoulders and elbows command lead (XR_LOWER_ARM_LEAD)
+    LOWER_WRIST_KD = 0.0      # [RT6g] wrists kd while lowering (XR_LOWER_WRIST_KD); 0 = keep (RT6g used 4)
+    LOWER_WRIST_LEAD = 0.05   # [RT6g] rad, wrists command lead (XR_LOWER_WRIST_LEAD); RT6g value
+
+    def lower_and_release(self, q_rest=None, gravity_fn=None, speed=0.3, hold_t=0.5,
+                          release_t=1.5, max_err=None, timeout=30.0, profile=None,
+                          wrist_speed=None, wrist_lead=None, cmd_vel=None, arm_kd=None):
+        '''[RT6b, RT6d, RT6g] Lower both arms to q_rest under control, then ramp all gains to zero.
+
+        Blocking; returns (ok, seconds). q_rest defaults to the pose measured at start.
+        speed (rad/s) is the most any arm joint may move. The plan is min-jerk (no step in
+        speed or acceleration at either end): shoulders and elbows peak at
+        LOWER_PLAN_FRAC * speed; [RT6g] wrists have their own plan peaking at wrist_speed
+        (XR_LOWER_WRIST_SPEED, default 0.15 rad/s) with a command lead of wrist_lead
+        (XR_LOWER_WRIST_LEAD, default 0.05 rad). Each group has a governor that slows,
+        then stops, its clock when one of its joints reads over LOWER_GOV * speed.
+        profile="linear" (or XR_LOWER_PROFILE=linear) is the RT6b plan, for comparison.
+        max_err (rad) bounds how far the command may lead the measured pose (shoulders,
+        elbows), so a blocked arm sees at most kp * max_err. Afterwards every motor is
+        commanded kp = 0 (damping kd kept, no torque): no drop.
+
+        [RT6h] RT6g on the robot still read 0.55 to 0.60 rad/s (right shoulder yaw, left
+        wrist roll): stick-slip. Three changes, all in the min-jerk profile:
+          * the command is rate limited to cmd_vel (XR_LOWER_CMD_VEL, LOWER_CMD_VEL rad/s)
+            from the last command, so it can no longer run along with a joint that broke
+            loose; such a joint overtakes it and kp brakes it;
+          * every shoulder and elbow gets kd arm_kd (XR_LOWER_KD, LOWER_ARM_KD) for the
+            lowering and the release, the wrists XR_LOWER_WRIST_KD as before;
+          * the shoulder and elbow lead is max_err (XR_LOWER_ARM_LEAD, LOWER_ARM_LEAD rad),
+            so a stuck joint stores at most kp * lead before it breaks loose.'''
+        profile = (profile or os.environ.get("XR_LOWER_PROFILE", "minjerk")).strip().lower()
+        if profile not in ("minjerk", "linear"):
+            raise ValueError(f"lowering profile {profile!r}: use minjerk or linear")
+        if wrist_speed is None:
+            wrist_speed = float(os.environ.get("XR_LOWER_WRIST_SPEED", "0.15") or 0.15)
+        if wrist_lead is None:
+            wrist_lead = float(os.environ.get("XR_LOWER_WRIST_LEAD", "") or self.LOWER_WRIST_LEAD)
+        linear = profile == "linear"
+        if max_err is None:
+            max_err = 0.15 if linear else float(os.environ.get("XR_LOWER_ARM_LEAD", "") or self.LOWER_ARM_LEAD)
+        if cmd_vel is None:
+            cmd_vel = 0.0 if linear else float(os.environ.get("XR_LOWER_CMD_VEL", "") or self.LOWER_CMD_VEL)
+        cmd_vel = min(float(cmd_vel), float(speed))
+        if arm_kd is None:
+            arm_kd = None if linear else float(os.environ.get("XR_LOWER_KD", "") or self.LOWER_ARM_KD)
+        wrist_speed = min(float(wrist_speed), float(speed))
+        q_rest = self.q_rest if q_rest is None else np.asarray(q_rest, dtype=float)
+        if self._released is not None:
+            logger_mp.error(f"[G1_29_ArmController] no lowering: already released ({self._released})")
+            return False, 0.0
+        q0 = self.get_current_dual_arm_q().copy()
+        self._lower_done.clear()
+        t_start = time.monotonic()
+        plan = self._make_lower_plan(q0, q_rest, gravity_fn, speed, hold_t, release_t, max_err,
+                                     profile, wrist_speed, wrist_lead, t_start, cmd_vel=cmd_vel)
+        # [RT6g] More damping on the wrists for the lowering and the release: a wrist held
+        # by gearbox friction that breaks loose is braked by kd * dq at the motor, at once
+        # (the lead fade and the governor act a control step or more later). Terminal speed
+        # after a breakaway is about (static - sliding friction) / kd.
+        wrist_kd = float(os.environ.get("XR_LOWER_WRIST_KD", "") or self.LOWER_WRIST_KD) if profile != "linear" else None
+        with self.ctrl_lock:
+            if wrist_kd is not None:
+                for id in G1_29_JointArmIndex:
+                    if self._Is_wrist_motor(id):
+                        if wrist_kd > 0:
+                            self.msg.motor_cmd[id].kd = max(float(self.msg.motor_cmd[id].kd), wrist_kd)
+                    elif arm_kd is not None and arm_kd > 0:
+                        self.msg.motor_cmd[id].kd = max(float(self.msg.motor_cmd[id].kd), arm_kd)
+            self._lower = plan
+        T = plan["T"]
+        if profile == "linear":
+            logger_mp.info(f"[G1_29_ArmController] lowering to the rest pose: {T:.1f} s at "
+                           f"{speed:g} rad/s (linear), hold {hold_t:g} s, release {release_t:g} s")
+        else:
+            ga, gw = plan["groups"]
+            logger_mp.info(f"[G1_29_ArmController] lowering to the rest pose: shoulders/elbows {ga['T']:.1f} s "
+                           f"(min-jerk peak {ga['peak']:.2f} rad/s, lead {max_err:g} rad, kd "
+                           f"{(f'{arm_kd:g}' if arm_kd else 'as following')}), wrists "
+                           f"{gw['T']:.1f} s (peak {gw['peak']:.2f} rad/s, lead {wrist_lead:g} rad, kd "
+                           f"{(f'{wrist_kd:g}' if wrist_kd else 'as following')}), "
+                           f"command rate limited to {cmd_vel:g} rad/s, slowed above "
+                           f"{self.LOWER_GOV[0] * speed:.2f} rad/s measured (limit {speed:g}), "
+                           f"hold {hold_t:g} s, release {release_t:g} s")
+        ok = self._lower_done.wait(timeout=3.0 * T + 10.0 + hold_t + release_t + timeout)
+        if self._released is not None:
+            logger_mp.error(f"[G1_29_ArmController] lowering ended by the release at once ({self._released}) "
+                            f"after {time.monotonic() - t_start:.1f} s")
+            return False, time.monotonic() - t_start
+        reached = float(np.max(np.abs(self.get_current_dual_arm_q() - q_rest)))
+        lo = self._lower
+        extra = ""
+        if profile == "minjerk":
+            ga, gw = lo["groups"]
+            extra = (f", filtered speed max shoulders/elbows {ga['v_max']:.2f} wrists {gw['v_max']:.2f} rad/s, "
+                     f"governor active {ga['gov_steps'] * self.control_dt:.1f} / {gw['gov_steps'] * self.control_dt:.1f} s")
+            if ga["gov_off"] or gw["gov_off"]:
+                extra += " (WATCHDOG: a speed governor was overridden after 2 T + 10 s)"
+        logger_mp.info(f"[G1_29_ArmController] lowered and released: {'ok' if ok else 'TIMEOUT'}, "
+                       f"{time.monotonic() - t_start:.1f} s, measured off rest by max {reached:.3f} rad" + extra)
+        return ok, time.monotonic() - t_start
+
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")

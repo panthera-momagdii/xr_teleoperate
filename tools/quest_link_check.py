@@ -215,6 +215,9 @@ def main():
 
     rc = EXIT_NO_CONNECT
     started = time.monotonic()
+    # [RT4] Defined before the try: the Ctrl-C path below reads them.
+    connected_at = None
+    hands_ever = False
     period = 1.0 / args.rate
     try:
         baseline = None
@@ -289,8 +292,14 @@ def main():
                 break
             time.sleep(period)
     except KeyboardInterrupt:
-        print("\nCtrl-C -- closing the wrapper.")
-        rc = EXIT_OK
+        # [RT4] Was `rc = EXIT_OK` unconditionally, so stopping a check that never saw a
+        # headset exited 0 -- indistinguishable from a pass (RT2, 13 Oct 2026). Report
+        # what had actually happened by the time of the Ctrl-C.
+        rc = (EXIT_OK if hands_ever
+              else EXIT_NO_HANDS if connected_at is not None
+              else EXIT_NO_CONNECT)
+        print(f"\nCtrl-C -- closing the wrapper. Outcome so far: exit {rc} "
+              f"({'hands tracked' if hands_ever else 'connected, no hands' if connected_at is not None else 'never connected'}).")
     finally:
         try:
             wrapper.close()
